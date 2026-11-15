@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
-import { port, serverLogs } from './serve'
 import { browserLogs, editFile, isServe, page } from '~utils'
+import { port, serverLogs } from './serve'
 
 const url = `http://localhost:${port}`
 
@@ -68,15 +68,13 @@ test.runIf(isServe)('html proxy is encoded', async () => {
 
 // run this at the end to reduce flakiness
 test.runIf(isServe)('should restart ssr', async () => {
-  editFile('./vite.config.ts', (content) => content)
+  editFile('./vite.config.ts', (content) => content + '\n')
   await expect
     .poll(() => {
-      expect(serverLogs).toEqual(
-        expect.arrayContaining([expect.stringMatching('server restarted')]),
+      expect(serverLogs).toContainEqual(
+        expect.stringMatching('server restarted'),
       )
-      expect(serverLogs).not.toEqual(
-        expect.arrayContaining([expect.stringMatching('error')]),
-      )
+      expect(serverLogs).not.toContainEqual(expect.stringMatching('error'))
     })
     .toSatisfy(() => true)
 })

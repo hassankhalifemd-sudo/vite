@@ -1,7 +1,7 @@
 import type { HotPayload } from '#types/hmrPayload'
-import { slash, unwrapId } from '../shared/utils'
 import { ERR_OUTDATED_OPTIMIZED_DEP } from '../shared/constants'
 import { createHMRHandler } from '../shared/hmrHandler'
+import { slash } from '../shared/utils'
 import type { ModuleRunner } from './runner'
 
 export function createHMRHandlerForRunner(
@@ -19,9 +19,6 @@ export function createHMRHandlerForRunner(
         await Promise.all(
           payload.updates.map(async (update): Promise<void> => {
             if (update.type === 'js-update') {
-              // runner always caches modules by their full path without /@id/ prefix
-              update.acceptedPath = unwrapId(update.acceptedPath)
-              update.path = unwrapId(update.path)
               return hmrClient.queueUpdate(update)
             }
 
@@ -47,21 +44,7 @@ export function createHMRHandlerForRunner(
 
         hmrClient.logger.debug(`program reload`)
         await hmrClient.notifyListeners('vite:beforeFullReload', payload)
-        runner.evaluatedModules.clear()
-
-        for (const url of clearEntrypointUrls) {
-          if (runner.isClosed()) break
-          try {
-            await runner.import(url)
-          } catch (err) {
-            if (runner.isClosed()) break
-            if (err.code !== ERR_OUTDATED_OPTIMIZED_DEP) {
-              hmrClient.logger.error(
-                `An error happened during full reload\n${err.message}\n${err.stack}`,
-              )
-            }
-          }
-        }
+        await reimportEntrypoints(runner, clearEntrypointUrls)
         break
       }
       case 'prune':
@@ -78,12 +61,48 @@ export function createHMRHandlerForRunner(
       }
       case 'ping': // noop
         break
+      case 'bundled-dev-update':
+        runner._bundledDevHmrClient?.handlePush(payload)
+        break
       default: {
         const check: never = payload
         return check
       }
     }
   })
+}
+
+/**
+ * The module runner equivalent of a browser page reload: drop every evaluated
+ * module and run the entrypoints again.
+ */
+export function reloadEntrypoints(runner: ModuleRunner): Promise<void> {
+  return reimportEntrypoints(runner, findAllEntrypoints(runner))
+}
+
+async function reimportEntrypoints(
+  runner: ModuleRunner,
+  entrypointUrls: Set<string>,
+): Promise<void> {
+  if (runner._bundledDevHmrClient) {
+    await runner._resetBundledDevRuntime()
+  } else {
+    runner.evaluatedModules.clear()
+  }
+
+  for (const url of entrypointUrls) {
+    if (runner.isClosed()) break
+    try {
+      await runner.import(url)
+    } catch (err) {
+      if (runner.isClosed()) break
+      if (err.code !== ERR_OUTDATED_OPTIMIZED_DEP) {
+        runner.hmrClient?.logger.error(
+          `An error happened during full reload\n${err.message}\n${err.stack}`,
+        )
+      }
+    }
+  }
 }
 
 function getModulesByFile(runner: ModuleRunner, file: string): string[] {

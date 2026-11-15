@@ -12,6 +12,8 @@ If you need a custom integration, you can follow the steps in this guide to conf
    import { defineConfig } from 'vite'
    // ---cut---
    export default defineConfig({
+     // overwrite default .html entry
+     input: '/path/to/main.js',
      server: {
        cors: {
          // the origin you will be accessing via browser
@@ -21,10 +23,6 @@ If you need a custom integration, you can follow the steps in this guide to conf
      build: {
        // generate .vite/manifest.json in outDir
        manifest: true,
-       rollupOptions: {
-         // overwrite default .html entry
-         input: '/path/to/main.js',
-       },
      },
    })
    ```
@@ -164,6 +162,14 @@ If you need a custom integration, you can follow the steps in this guide to conf
       */
      isDynamicEntry?: boolean
      /**
+      * Whether this chunk belongs to a web worker bundle.
+      */
+     isWorker?: boolean
+     /**
+      * Whether this chunk is the entry point of a web worker bundle.
+      */
+     isWorkerEntry?: boolean
+     /**
       * The list of statically imported chunks by this chunk
       *
       * The values are the keys of the manifest. This field is only present in JS chunks.
@@ -179,9 +185,10 @@ If you need a custom integration, you can follow the steps in this guide to conf
    ```
 
    Each entry in the manifest represents one of the following:
-   - **Entry chunks**: Generated from files specified in [`build.rollupOptions.input`](https://rollupjs.org/configuration-options/#input). These chunks have `isEntry: true` and their key is the relative src path from project root.
+   - **Entry chunks**: Generated from files specified in [`build.rolldownOptions.input`](https://rolldown.rs/reference/InputOptions.input#input). These chunks have `isEntry: true` and their key is the relative src path from project root.
    - **Dynamic entry chunks**: Generated from dynamic imports. These chunks have `isDynamicEntry: true` and their key is the relative src path from project root.
    - **Non-entry chunks**: Their key is the base name of the generated file prefixed with `_`.
+   - **Worker chunks**: Generated from imported web workers. These chunks have `isWorker: true`. Worker entries also have `isWorkerEntry: true`. Their keys use the generated file name prefixed with `_worker_`.
    - **Asset chunks**: Generated from imported assets like images, fonts. Their key is the relative src path from project root.
    - **CSS files**: When [`build.cssCodeSplit`](/config/build-options.md#build-csscodesplit) is `false`, a single CSS file is generated with the key `style.css`. When `build.cssCodeSplit` is not `false`, the key is generated similar to JS chunks (i.e. entry chunks will not have `_` prefix and non-entry chunks will have `_` prefix).
 
@@ -270,4 +277,11 @@ If you need a custom integration, you can follow the steps in this guide to conf
    }
    ```
 
+   :::
+
+   :::info Chunk Import Maps Support (Experimental)
+
+   If you are using the experimental [`build.chunkImportMap`](/config/build-options#build-chunkimportmap) option, you also need to inject the import map into the HTML.
+
+   The import map is output to `importmap.json` in the output directory. Make sure to inject the `<script type="importmap">` tag before any `<script type="module">` tags or `<link rel="modulepreload">` tags.
    :::

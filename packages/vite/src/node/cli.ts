@@ -1,16 +1,18 @@
-import path from 'node:path'
 import fs from 'node:fs'
-import { inspect } from 'node:util'
+import path from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { inspect } from 'node:util'
 import { cac } from 'cac'
 import colors from 'picocolors'
-import { VERSION } from './constants'
+import { createBuilder } from './build'
 import type { BuildEnvironmentOptions } from './build'
-import type { ServerOptions } from './server'
-import type { CLIShortcut } from './shortcuts'
+import { commandLockPlugin, createCommandLock } from './commandLock'
+import type { InlineConfig } from './config'
+import { VERSION } from './constants'
 import type { LogLevel } from './logger'
 import { createLogger } from './logger'
-import type { InlineConfig } from './config'
+import type { ServerOptions } from './server'
+import type { CLIShortcut } from './shortcuts'
 
 function checkNodeVersion(nodeVersion: string): boolean {
   const currentVersion = nodeVersion.split('.')
@@ -44,12 +46,14 @@ interface GlobalCLIOptions {
   logLevel?: LogLevel
   clearScreen?: boolean
   configLoader?: 'bundle' | 'runner' | 'native'
+  profile?: boolean | string
   d?: boolean | string
   debug?: boolean | string
   f?: string
   filter?: string
   m?: string
   mode?: string
+  bypassLock?: boolean
   force?: boolean
   w?: boolean
 }
@@ -70,12 +74,13 @@ export const stopProfiler = (
 ): void | Promise<void> => {
   if (!profileSession) return
   return new Promise((res, rej) => {
-    profileSession!.post('Profiler.stop', (err: any, { profile }: any) => {
+    profileSession!.post('Profiler.stop', (err, { profile }) => {
       // Write profile to disk, upload, etc.
       if (!err) {
-        const outPath = path.resolve(
-          `./vite-profile-${profileCount++}.cpuprofile`,
-        )
+        const name = global.__vite_profile_name ?? 'vite-profile'
+        const count = profileCount++
+        const fileName = count === 0 ? name : `${name}-${count}`
+        const outPath = path.resolve(`./${fileName}.cpuprofile`)
         fs.writeFileSync(outPath, JSON.stringify(profile))
         log(
           colors.yellow(
@@ -94,7 +99,7 @@ export const stopProfiler = (
 const filterDuplicateOptions = <T extends object>(options: T) => {
   for (const [key, value] of Object.entries(options)) {
     if (Array.isArray(value)) {
-      options[key as keyof T] = value[value.length - 1]
+      options[key as keyof T] = value.at(-1)
     }
   }
 }
@@ -113,12 +118,14 @@ function cleanGlobalCLIOptions<Options extends GlobalCLIOptions>(
   delete ret.logLevel
   delete ret.clearScreen
   delete ret.configLoader
+  delete ret.profile
   delete ret.d
   delete ret.debug
   delete ret.f
   delete ret.filter
   delete ret.m
   delete ret.mode
+  delete ret.bypassLock
   delete ret.force
   delete ret.w
 
@@ -180,11 +187,16 @@ cli
   .option('--clearScreen', `[boolean] allow/disable clear screen when logging`)
   .option(
     '--configLoader <loader>',
-    `[string] use 'bundle' to bundle the config with Rolldown, or 'runner' (experimental) to process it on the fly, or 'native' (experimental) to load using the native runtime (default: bundle)`,
+    `[string] use 'bundle' to bundle the config with Rolldown, or 'native' to load using the native runtime (default: bundle)`,
+  )
+  .option(
+    '--profile [name]',
+    `[boolean | string] start built-in Node.js inspector`,
   )
   .option('-d, --debug [feat]', `[string | boolean] show debug logs`)
   .option('-f, --filter <filter>', `[string] filter debug logs`)
   .option('-m, --mode <mode>', `[string] set env mode`)
+  .option('--bypass-lock', `[boolean] disable process locks`)
 
 // dev
 cli
@@ -222,6 +234,7 @@ cli
           configLoader: options.configLoader,
           logLevel: options.logLevel,
           clearScreen: options.clearScreen,
+          plugins: options.bypassLock ? [] : [commandLockPlugin()],
           server: cleanGlobalCLIOptions(options),
           forceOptimizeDeps: options.force,
           experimental: {
@@ -346,7 +359,6 @@ cli
       options: BuildEnvironmentOptions & BuilderCLIOptions & GlobalCLIOptions,
     ) => {
       filterDuplicateOptions(options)
-      const { createBuilder } = await import('./build')
 
       const buildOptions: BuildEnvironmentOptions = cleanGlobalCLIOptions(
         cleanBuilderCLIOptions(options),
@@ -365,6 +377,9 @@ cli
           ...(options.app ? { builder: {} } : {}),
         }
         const builder = await createBuilder(inlineConfig, null)
+        if (!options.bypassLock) {
+          await createCommandLock(builder.config, 'build', null)
+        }
         await builder.buildApp()
         await builder.runDevTools()
       } catch (e) {
@@ -448,6 +463,7 @@ cli
           configLoader: options.configLoader,
           logLevel: options.logLevel,
           mode: options.mode,
+          plugins: options.bypassLock ? [] : [commandLockPlugin()],
           build: {
             outDir: options.outDir,
           },

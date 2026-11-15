@@ -1,49 +1,72 @@
 import { relative, resolve } from 'node:path'
 import { defineConfig } from 'vite'
+import { inject } from 'vitest'
+
+const isBundledDev =
+  !!process.env.VITEST && inject('playgroundMode') === 'serve-bundled'
 
 const dirname = import.meta.dirname
 
-export default defineConfig({
+const input = {
+  main: resolve(dirname, 'index.html'),
+  nested: resolve(dirname, 'nested/index.html'),
+  scriptAsync: resolve(dirname, 'scriptAsync.html'),
+  scriptMixed: resolve(dirname, 'scriptMixed.html'),
+  emptyAttr: resolve(dirname, 'emptyAttr.html'),
+  link: resolve(dirname, 'link.html'),
+  'link/target': resolve(dirname, 'index.html'),
+  zeroJS: resolve(dirname, 'zeroJS.html'),
+  noHead: resolve(dirname, 'noHead.html'),
+  noBody: resolve(dirname, 'noBody.html'),
+  inlinea: resolve(dirname, 'inline/shared_a.html'),
+  inline1: resolve(dirname, 'inline/shared-1.html'),
+  inline2: resolve(dirname, 'inline/shared-2.html'),
+  inline3: resolve(dirname, 'inline/unique.html'),
+  unicodePath: resolve(
+    dirname,
+    'unicode-path/中文-にほんご-한글-🌕🌖🌗/index.html',
+  ),
+  linkProps: resolve(dirname, 'link-props/index.html'),
+  valid: resolve(dirname, 'valid.html'),
+  importmapOrder: resolve(dirname, 'importmapOrder.html'),
+  env: resolve(dirname, 'env.html'),
+  sideEffects: resolve(dirname, 'side-effects/index.html'),
+  'a á': resolve(dirname, 'a á.html'),
+  serveFile: resolve(dirname, 'serve/file.html'),
+  serveFolder: resolve(dirname, 'serve/folder/index.html'),
+  serveBothFile: resolve(dirname, 'serve/both.html'),
+  serveBothFolder: resolve(dirname, 'serve/both/index.html'),
+  write: resolve(dirname, 'write.html'),
+  'transform-inline-js': resolve(dirname, 'transform-inline-js.html'),
+  malformedUrl: resolve(dirname, 'malformed-url.html'),
+  tagRemovalModuleScript: resolve(dirname, 'tag-removal/module-script.html'),
+  tagRemovalStylesheet: resolve(dirname, 'tag-removal/stylesheet.html'),
+  // resolved from `process.cwd()` by Rolldown (resolved from `root` by vite's resolver first)
+  relativeInput: relative(
+    process.cwd(),
+    resolve(dirname, 'relative-input.html'),
+  ),
+}
+
+const serveInput = {
+  ...input,
+  ...(isBundledDev
+    ? {}
+    : {
+        invalid: resolve(dirname, 'invalid.html'),
+        invalidClick: resolve(dirname, 'invalidClick.html'),
+        invalidEscape: resolve(dirname, 'invalidEscape.html'),
+      }),
+  protocolRelative: resolve(dirname, 'protocol-relative.html'),
+  relativeInput: resolve(dirname, 'relative-input.html'),
+}
+
+export default defineConfig(({ command }) => ({
+  input: command === 'serve' ? serveInput : input,
+
   base: './',
   build: {
-    rollupOptions: {
-      input: {
-        main: resolve(dirname, 'index.html'),
-        nested: resolve(dirname, 'nested/index.html'),
-        scriptAsync: resolve(dirname, 'scriptAsync.html'),
-        scriptMixed: resolve(dirname, 'scriptMixed.html'),
-        emptyAttr: resolve(dirname, 'emptyAttr.html'),
-        link: resolve(dirname, 'link.html'),
-        'link/target': resolve(dirname, 'index.html'),
-        zeroJS: resolve(dirname, 'zeroJS.html'),
-        noHead: resolve(dirname, 'noHead.html'),
-        noBody: resolve(dirname, 'noBody.html'),
-        inlinea: resolve(dirname, 'inline/shared_a.html'),
-        inline1: resolve(dirname, 'inline/shared-1.html'),
-        inline2: resolve(dirname, 'inline/shared-2.html'),
-        inline3: resolve(dirname, 'inline/unique.html'),
-        unicodePath: resolve(
-          dirname,
-          'unicode-path/中文-にほんご-한글-🌕🌖🌗/index.html',
-        ),
-        linkProps: resolve(dirname, 'link-props/index.html'),
-        valid: resolve(dirname, 'valid.html'),
-        importmapOrder: resolve(dirname, 'importmapOrder.html'),
-        env: resolve(dirname, 'env.html'),
-        sideEffects: resolve(dirname, 'side-effects/index.html'),
-        'a á': resolve(dirname, 'a á.html'),
-        serveFile: resolve(dirname, 'serve/file.html'),
-        serveFolder: resolve(dirname, 'serve/folder/index.html'),
-        serveBothFile: resolve(dirname, 'serve/both.html'),
-        serveBothFolder: resolve(dirname, 'serve/both/index.html'),
-        write: resolve(dirname, 'write.html'),
-        'transform-inline-js': resolve(dirname, 'transform-inline-js.html'),
-        relativeInput: relative(
-          process.cwd(),
-          resolve(dirname, 'relative-input.html'),
-        ),
-        malformedUrl: resolve(dirname, 'malformed-url.html'),
-      },
+    rolldownOptions: {
       external: ['/external-path-by-rollup-options.js'],
     },
   },
@@ -70,6 +93,9 @@ export default defineConfig({
           if (html.includes('/@vite/client')) {
             throw new Error('pre transform applied at wrong time!')
           }
+
+          // Keep adjacent tags on the first line for the tag removal regression.
+          if (filename.includes('/tag-removal/')) return
 
           const doctypeRE = /<!doctype html>/i
           if (doctypeRE.test(html)) return
@@ -141,7 +167,7 @@ ${
             {
               tag: 'p',
               attrs: { class: 'server' },
-              children: 'This is injected only during dev',
+              children: 'This is injected only when unbundled',
               injectTo: 'body',
             },
           ]
@@ -156,7 +182,7 @@ ${
             {
               tag: 'p',
               attrs: { class: 'build' },
-              children: 'This is injected only during build',
+              children: 'This is injected only when bundled',
               injectTo: 'body',
             },
           ]
@@ -268,7 +294,7 @@ ${
     },
     serveExternalPathPlugin(),
   ],
-})
+}))
 
 /** @returns {import('vite').Plugin} */
 function serveExternalPathPlugin() {

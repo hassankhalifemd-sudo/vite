@@ -1,38 +1,63 @@
 import path from 'node:path'
+import { type Import, init, parse } from 'es-module-lexer'
 import MagicString from 'magic-string'
-import type { RolldownOutput, RollupError } from 'rolldown'
 import colors from 'picocolors'
-import { type ImportSpecifier, init, parse } from 'es-module-lexer'
+import type {
+  OutputAsset,
+  OutputChunk,
+  PluginContext,
+  RolldownOutput,
+  RollupError,
+} from 'rolldown'
 import { viteWebWorkerPostPlugin as nativeWebWorkerPostPlugin } from 'rolldown/experimental'
-import type { ResolvedConfig } from '../config'
-import { type Plugin, perEnvironmentPlugin } from '../plugin'
-import { ENV_ENTRY, ENV_PUBLIC_PATH } from '../constants'
-import {
-  encodeURIPath,
-  getHash,
-  injectQuery,
-  normalizePath,
-  prettifyUrl,
-  urlRE,
-} from '../utils'
+import { cleanUrl, splitFileAndPostfix } from '../../shared/utils'
 import {
   BuildEnvironment,
   ChunkMetadataMap,
-  createToImportMetaURLBasedRelativeRuntime,
   injectEnvironmentToHooks,
   onRollupLog,
-  toOutputFilePathInJS,
 } from '../build'
-import { cleanUrl } from '../../shared/utils'
+import type { ResolvedConfig } from '../config'
+import { ENV_ENTRY, ENV_PUBLIC_PATH } from '../constants'
+import type { Environment } from '../environment'
 import type { Logger } from '../logger'
+import type { Plugin } from '../plugin'
+import {
+  injectQuery,
+  normalizePath,
+  prettifyUrl,
+  trailingSeparatorRE,
+  urlRE,
+} from '../utils'
 import { fileToUrl, toOutputFilePathInJSForBundledDev } from './asset'
+import { getChunkOriginalFileName, type Manifest } from './manifest'
+
+type WorkerChunkManifest = {
+  fileName: string
+  name: string
+  originalFileName: string | undefined
+  isEntry: boolean
+  isDynamicEntry: boolean
+  imports: string[]
+  dynamicImports: string[]
+  importedCss: string[]
+  importedAssets: string[]
+}
 
 type WorkerBundle = {
   entryFilename: string
   entryCode: string
-  entryUrlPlaceholder: string
+  chunkManifests: WorkerChunkManifest[]
   referencedAssets: Set<string>
+  moduleIds: Set<string>
   watchedFiles: string[]
+  /**
+   * referenceId of the entry emitted for each build via
+   * `import.meta.ROLLDOWN_FILE_URL_<id>`. Keyed by `Environment` because
+   * referenceIds are per-build and this bundle is shared across the main build
+   * and nested worker sub-builds.
+   */
+  entryReferenceIds: WeakMap<Environment, /* referenceId */ string>
 }
 
 type WorkerBundleAsset = {
@@ -43,6 +68,20 @@ type WorkerBundleAsset = {
   source: string | Uint8Array
 }
 
+/** The input ID of a worker entry, which identifies its bundle. */
+type WorkerBundleId = string
+
+/** `undefined` identifies the main bundle. */
+type BundleId = WorkerBundleId | undefined
+
+const workerManifests = new WeakMap<Environment, Manifest>()
+
+export function getWorkerManifest(
+  environment: Environment,
+): Manifest | undefined {
+  return workerManifests.get(environment)
+}
+
 class WorkerOutputCache {
   /**
    * worker bundle information for each input id
@@ -51,18 +90,31 @@ class WorkerOutputCache {
   private bundles = new Map</* inputId */ string, WorkerBundle>()
   /** list of assets emitted for the worker bundles */
   private assets = new Map<string, WorkerBundleAsset>()
-  private fileNameHash = new Map<
-    /* hash */ string,
-    /* entryFilename */ string
-  >()
   private invalidatedBundles = new Set</* inputId */ string>()
+  /**
+   * Worker references grouped by their containing bundle and module.
+   * `referencingModuleId` is the module whose inclusion keeps the reference
+   * live: the worker wrapper module for a `?worker` import, or the importing
+   * module for a `new URL(..., import.meta.url)` worker reference.
+   * `childBundleId` identifies the referenced worker bundle and is used as its
+   * `BundleId` when traversing that bundle's references.
+   */
+  private bundleReferences = new Map<
+    BundleId,
+    Map<
+      /* referencingModuleId */ string,
+      Set</* childBundleId */ WorkerBundleId>
+    >
+  >()
 
   saveWorkerBundle(
     file: string,
     watchedFiles: string[],
     outputEntryFilename: string,
     outputEntryCode: string,
+    chunkManifests: WorkerChunkManifest[],
     outputAssets: WorkerBundleAsset[],
+    moduleIds: Set<string>,
     logger: Logger,
   ): WorkerBundle {
     for (const asset of outputAssets) {
@@ -71,10 +123,11 @@ class WorkerOutputCache {
     const bundle: WorkerBundle = {
       entryFilename: outputEntryFilename,
       entryCode: outputEntryCode,
-      entryUrlPlaceholder:
-        this.generateEntryUrlPlaceholder(outputEntryFilename),
+      chunkManifests: chunkManifests,
       referencedAssets: new Set(outputAssets.map((asset) => asset.fileName)),
+      moduleIds,
       watchedFiles,
+      entryReferenceIds: new WeakMap(),
     }
     this.bundles.set(file, bundle)
     return bundle
@@ -115,7 +168,6 @@ class WorkerOutputCache {
     if (!bundle) return
 
     this.bundles.delete(file)
-    this.fileNameHash.delete(getHash(bundle.entryFilename))
 
     this.assets.delete(bundle.entryFilename)
 
@@ -126,6 +178,87 @@ class WorkerOutputCache {
         this.assets.delete(asset)
       }
     }
+
+    this.bundleReferences.delete(file)
+  }
+
+  recordReference(
+    parentInputId: BundleId,
+    childBundleId: WorkerBundleId,
+    referencingModuleId: string,
+  ) {
+    let referencesByModule = this.bundleReferences.get(parentInputId)
+    if (!referencesByModule) {
+      referencesByModule = new Map()
+      this.bundleReferences.set(parentInputId, referencesByModule)
+    }
+    let childBundleIds = referencesByModule.get(referencingModuleId)
+    if (!childBundleIds) {
+      childBundleIds = new Set()
+      referencesByModule.set(referencingModuleId, childBundleIds)
+    }
+    childBundleIds.add(childBundleId)
+  }
+
+  getLiveAssetFileNames(
+    rootBundleId: BundleId,
+    rootLiveModuleIds: Set<string>,
+  ): Set<string> {
+    const liveBundles = new Set<string>()
+    const queue: [BundleId, Set<string>][] = [[rootBundleId, rootLiveModuleIds]]
+    while (queue.length > 0) {
+      const [bundleId, moduleIds] = queue.shift()!
+      const referencesByModule = this.bundleReferences.get(bundleId)
+      if (!referencesByModule) continue
+      for (const moduleId of moduleIds) {
+        const childBundleIds = referencesByModule.get(moduleId)
+        if (!childBundleIds) continue
+        for (const childBundleId of childBundleIds) {
+          if (liveBundles.has(childBundleId)) continue
+          liveBundles.add(childBundleId)
+          const childBundle = this.bundles.get(childBundleId)
+          if (childBundle) {
+            queue.push([childBundleId, childBundle.moduleIds])
+          }
+        }
+      }
+    }
+
+    const liveFileNames = new Set<string>()
+    for (const inputId of liveBundles) {
+      const wb = this.bundles.get(inputId)
+      if (!wb) continue
+      liveFileNames.add(wb.entryFilename)
+      for (const fileName of wb.referencedAssets) {
+        liveFileNames.add(fileName)
+      }
+    }
+    return liveFileNames
+  }
+
+  getDeadDirectlyReferencedBundles(
+    bundleId: BundleId,
+    liveModuleIds: Set<string>,
+  ): WorkerBundle[] {
+    const referencesByModule = this.bundleReferences.get(bundleId)
+    if (!referencesByModule) return []
+    const deadBundleIds = new Set<WorkerBundleId>()
+    for (const references of referencesByModule.values()) {
+      for (const childBundleId of references) {
+        deadBundleIds.add(childBundleId)
+      }
+    }
+    for (const moduleId of liveModuleIds) {
+      for (const childBundleId of referencesByModule.get(moduleId) || []) {
+        deadBundleIds.delete(childBundleId)
+      }
+    }
+    const deadBundles: WorkerBundle[] = []
+    for (const childBundleId of deadBundleIds) {
+      const bundle = this.bundles.get(childBundleId)
+      if (bundle) deadBundles.push(bundle)
+    }
+    return deadBundles
   }
 
   getWorkerBundle(file: string) {
@@ -136,16 +269,78 @@ class WorkerOutputCache {
     return this.assets.values()
   }
 
-  getEntryFilenameFromHash(hash: string) {
-    return this.fileNameHash.get(hash)
+  getChunkManifest(liveFileNames?: Set<string>): Manifest {
+    const manifest: Manifest = {}
+    for (const bundle of this.bundles.values()) {
+      // Inline workers are bundled but their entry is not emitted.
+      if (!this.assets.has(bundle.entryFilename)) continue
+
+      const keysByFileName = new Map(
+        bundle.chunkManifests.map((chunk) => [
+          chunk.fileName,
+          `_worker_${chunk.fileName}`,
+        ]),
+      )
+
+      for (const chunk of bundle.chunkManifests) {
+        if (liveFileNames && !liveFileNames.has(chunk.fileName)) continue
+
+        const imports = chunk.imports.flatMap((fileName) => {
+          const key = keysByFileName.get(fileName)
+          return key ? [key] : []
+        })
+        const dynamicImports = chunk.dynamicImports.flatMap((fileName) => {
+          const key = keysByFileName.get(fileName)
+          return key ? [key] : []
+        })
+
+        manifest[keysByFileName.get(chunk.fileName)!] = {
+          src: chunk.originalFileName,
+          file: chunk.fileName,
+          css: chunk.importedCss.length > 0 ? chunk.importedCss : undefined,
+          assets:
+            chunk.importedAssets.length > 0 ? chunk.importedAssets : undefined,
+          isWorkerEntry: chunk.isEntry,
+          name: chunk.name,
+          isDynamicEntry: chunk.isDynamicEntry,
+          isWorker: true,
+          imports: imports.length > 0 ? imports : undefined,
+          dynamicImports:
+            dynamicImports.length > 0 ? dynamicImports : undefined,
+        }
+      }
+    }
+    return manifest
   }
 
-  private generateEntryUrlPlaceholder(entryFilename: string): string {
-    const hash = getHash(entryFilename)
-    if (!this.fileNameHash.has(hash)) {
-      this.fileNameHash.set(hash, entryFilename)
+  /**
+   * Emit the worker entry as an asset (once per build) and return the JS
+   * expression referencing it: `import.meta.ROLLDOWN_FILE_URL_<referenceId>`. The
+   * `vite:asset` `resolveFileUrl` hook turns that into the final URL (respecting
+   * base / `renderBuiltUrl`). The emitted file is deduplicated against this
+   * cache's `generateBundle` emit via its content check.
+   */
+  generateEntryUrlExpr(
+    pluginContext: PluginContext,
+    bundle: WorkerBundle,
+  ): string {
+    const { environment } = pluginContext
+    let referenceId = bundle.entryReferenceIds.get(environment)
+    if (!referenceId) {
+      referenceId = pluginContext.emitFile({
+        type: 'asset',
+        fileName: bundle.entryFilename,
+        source: bundle.entryCode,
+      })
+      bundle.entryReferenceIds.set(environment, referenceId)
     }
-    return `__VITE_WORKER_ASSET__${hash}__`
+    return `import.meta.ROLLDOWN_FILE_URL_${referenceId}`
+  }
+
+  clearEntryReferenceIds(environment: Environment): void {
+    for (const bundle of this.bundles.values()) {
+      bundle.entryReferenceIds.delete(environment)
+    }
   }
 }
 
@@ -155,9 +350,53 @@ export const workerOrSharedWorkerRE: RegExp =
   /(?:\?|&)(worker|sharedworker)(?:&|$)/
 const workerFileRE = /(?:\?|&)worker_file&type=(\w+)(?:&|$)/
 const inlineRE = /[?&]inline\b/
+const workerQueriesRE =
+  /(\?|&)(?:(?:worker|sharedworker|inline|url)=?(?:&|$))+/g
+
+export function splitWorkerRequest(id: string): {
+  file: string
+  postfix: string
+} {
+  const { file, postfix } = splitFileAndPostfix(id)
+  if (!postfix || postfix[0] !== '?') {
+    return { file, postfix: '' }
+  }
+  return {
+    file,
+    postfix: postfix
+      .replace(workerQueriesRE, '$1')
+      .replace(trailingSeparatorRE, ''),
+  }
+}
 
 export const WORKER_FILE_ID = 'worker_file'
 const workerOutputCaches = new WeakMap<ResolvedConfig, WorkerOutputCache>()
+
+export function recordWorkerReference(
+  config: ResolvedConfig,
+  parentInputId: string | undefined,
+  childBundleId: WorkerBundleId,
+  referencingModuleId: string,
+): void {
+  workerOutputCaches
+    .get(config.mainConfig || config)!
+    .recordReference(parentInputId, childBundleId, referencingModuleId)
+}
+
+/**
+ * Reference a bundled worker entry as `import.meta.ROLLDOWN_FILE_URL_<id>` from the
+ * given build. Thin accessor over `WorkerOutputCache.generateEntryUrlExpr` so
+ * both `vite:worker` and `vite:worker-import-meta-url` can share the cache.
+ */
+export function generateWorkerEntryUrlExpr(
+  pluginContext: PluginContext,
+  config: ResolvedConfig,
+  bundle: WorkerBundle,
+): string {
+  return workerOutputCaches
+    .get(config.mainConfig || config)!
+    .generateEntryUrlExpr(pluginContext, bundle)
+}
 
 async function bundleWorkerEntry(
   config: ResolvedConfig,
@@ -183,14 +422,15 @@ async function bundleWorkerEntry(
 
   // bundle the file as entry to support imports
   const { rolldown } = await import('rolldown')
-  const { plugins, rollupOptions, format } = config.worker
+  const { plugins, rolldownOptions, format } = config.worker
   const workerConfig = await plugins(newBundleChain)
   const workerEnvironment = new BuildEnvironment('client', workerConfig) // TODO: should this be 'worker'?
   await workerEnvironment.init()
 
   const chunkMetadataMap = new ChunkMetadataMap()
+  const workerBuildTarget = workerEnvironment.config.build.target
   const bundle = await rolldown({
-    ...rollupOptions,
+    ...rolldownOptions,
     input,
     plugins: workerEnvironment.plugins.map((p) =>
       injectEnvironmentToHooks(workerEnvironment, chunkMetadataMap, p),
@@ -198,21 +438,30 @@ async function bundleWorkerEntry(
     onLog(level, log) {
       onRollupLog(level, log, workerEnvironment)
     },
+    transform: {
+      target: workerBuildTarget === false ? undefined : workerBuildTarget,
+      ...rolldownOptions.transform,
+      define: {
+        ...rolldownOptions.transform?.define,
+        // disable builtin process.env.NODE_ENV replacement as it is handled by the define plugin
+        'process.env.NODE_ENV': 'process.env.NODE_ENV',
+      },
+    },
     // TODO: remove this and enable rolldown's CSS support later
     moduleTypes: {
       '.css': 'js',
-      ...rollupOptions.moduleTypes,
+      ...rolldownOptions.moduleTypes,
     },
     preserveEntrySignatures: false,
     experimental: {
-      ...rollupOptions.experimental,
+      ...rolldownOptions.experimental,
       viteMode: true,
     },
   })
   let result: RolldownOutput
   let watchedFiles: string[] | undefined
   try {
-    const workerOutputConfig = config.worker.rollupOptions.output
+    const workerOutputConfig = config.worker.rolldownOptions.output
     const workerConfig = workerOutputConfig
       ? Array.isArray(workerOutputConfig)
         ? workerOutputConfig[0] || {}
@@ -257,6 +506,31 @@ async function bundleWorkerEntry(
     await bundle.close()
   }
 
+  const moduleIds = collectIncludedModuleIds(result.output)
+  const chunkManifests = result.output.flatMap(
+    (output): WorkerChunkManifest[] => {
+      if (output.type !== 'chunk') return []
+      const metadata = chunkMetadataMap.get(output)
+      return [
+        {
+          fileName: output.fileName,
+          name: output.name,
+          originalFileName: getChunkOriginalFileName(
+            output,
+            config.root,
+            false,
+          ),
+          isEntry: output.isEntry,
+          isDynamicEntry: output.isDynamicEntry,
+          imports: output.imports,
+          dynamicImports: output.dynamicImports,
+          importedCss: [...metadata.importedCss],
+          importedAssets: [...metadata.importedAssets],
+        },
+      ]
+    },
+  )
+
   const {
     output: [outputChunk, ...outputChunks],
   } = result
@@ -289,13 +563,13 @@ async function bundleWorkerEntry(
       watchedFiles,
       outputChunk.fileName,
       outputChunk.code,
+      chunkManifests,
       assets,
+      moduleIds,
       config.logger,
     )
   return newBundleInfo
 }
-
-export const workerAssetUrlRE: RegExp = /__VITE_WORKER_ASSET__([a-z\d]{8})__/g
 
 export async function workerFileToUrl(
   config: ResolvedConfig,
@@ -315,20 +589,41 @@ export async function workerFileToUrl(
   return bundle
 }
 
-export function webWorkerPostPlugin(config: ResolvedConfig): Plugin {
-  if (config.isBundled) {
-    return perEnvironmentPlugin(
-      'native:web-worker-post-plugin',
-      (environment) => {
+/**
+ * Emit the bundled worker files during `load` / `transform`.
+ *
+ * They normally reach the output through `generateBundle`, which an HMR patch
+ * skips, so without this a patched worker points at a file that was never
+ * emitted.
+ */
+export function emitWorkerAssetsForBundledDev(
+  pluginContext: { emitFile: PluginContext['emitFile'] },
+  config: ResolvedConfig,
+): void {
+  if (config.isWorker) return
+
+  const workerOutput = workerOutputCaches.get(config.mainConfig || config)!
+  for (const asset of workerOutput.getAssets()) {
+    pluginContext.emitFile({
+      type: 'asset',
+      fileName: asset.fileName,
+      source: asset.source,
+    })
+  }
+}
+
+export function webWorkerPostPlugin(_config: ResolvedConfig): Plugin {
+  return {
+    name: 'vite:worker-post',
+    applyToEnvironment(environment) {
+      if (environment.config.isBundled) {
         if (environment.config.worker.format === 'iife') {
           return nativeWebWorkerPostPlugin()
         }
-      },
-    )
-  }
-
-  return {
-    name: 'vite:worker-post',
+        return false
+      }
+      return true
+    },
     transform: {
       filter: {
         code: 'import.meta',
@@ -337,9 +632,9 @@ export function webWorkerPostPlugin(config: ResolvedConfig): Plugin {
       async handler(code, id) {
         // import.meta is unavailable in the IIFE worker, so we need to replace it
         if (this.environment.config.worker.format === 'iife') {
-          await init
+          await init()
 
-          let imports: readonly ImportSpecifier[]
+          let imports: readonly Import[]
           try {
             imports = parse(code)[0]
           } catch {
@@ -349,9 +644,9 @@ export function webWorkerPostPlugin(config: ResolvedConfig): Plugin {
 
           let injectedImportMeta = false
           let s: MagicString | undefined
-          for (const { s: start, e: end, d: dynamicIndex } of imports) {
+          for (const { type, start, end } of imports) {
             // is import.meta
-            if (dynamicIndex === -2) {
+            if (type === 'import-meta') {
               const prop = code.slice(end, end + 4)
               if (prop === '.url') {
                 s ||= new MagicString(code)
@@ -382,7 +677,6 @@ export function webWorkerPostPlugin(config: ResolvedConfig): Plugin {
 }
 
 export function webWorkerPlugin(config: ResolvedConfig): Plugin {
-  const isBuild = config.command === 'build'
   const isWorker = config.isWorker
 
   workerOutputCaches.set(config, new WorkerOutputCache())
@@ -394,6 +688,8 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
     buildStart() {
       if (isWorker) return
       emittedAssets.clear()
+      workerManifests.delete(this.environment)
+      workerOutputCaches.get(config)!.clearEntryReferenceIds(this.environment)
     },
 
     load: {
@@ -405,7 +701,8 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
         const { format } = config.worker
         const workerConstructor =
           workerMatch[1] === 'sharedworker' ? 'SharedWorker' : 'Worker'
-        const workerType = config.isBundled
+        const isBundled = this.environment.config.isBundled
+        const workerType = isBundled
           ? format === 'es'
             ? 'module'
             : 'classic'
@@ -416,13 +713,25 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
         }`
 
         let urlCode: string
-        if (config.isBundled) {
+        if (isBundled) {
           if (isWorker && config.bundleChain.at(-1) === cleanUrl(id)) {
             urlCode = 'self.location.href'
           } else if (inlineRE.test(id)) {
+            recordWorkerReference(
+              config,
+              config.bundleChain.at(-1),
+              cleanUrl(id),
+              id,
+            )
             const result = await bundleWorkerEntry(config, id)
             for (const file of result.watchedFiles) {
               this.addWatchFile(file)
+            }
+            // The entry is inlined, but assets referenced by the worker
+            // still need to be emitted during `load` since an HMR patch
+            // skips the generate phase.
+            if (this.environment.config.command === 'serve') {
+              emitWorkerAssetsForBundledDev(this, config)
             }
 
             const jsContent = `const jsContent = ${JSON.stringify(result.entryCode)};`
@@ -470,27 +779,38 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
               map: { mappings: '' },
             }
           } else {
+            recordWorkerReference(
+              config,
+              config.bundleChain.at(-1),
+              cleanUrl(id),
+              id,
+            )
             const result = await workerFileToUrl(config, id)
-            let url: string
             if (
               this.environment.config.command === 'serve' &&
-              this.environment.config.experimental.bundledDev
+              this.environment.config.isBundled
             ) {
-              url = toOutputFilePathInJSForBundledDev(
-                this.environment,
-                result.entryFilename,
+              emitWorkerAssetsForBundledDev(this, config)
+              urlCode = JSON.stringify(
+                toOutputFilePathInJSForBundledDev(
+                  this.environment,
+                  result.entryFilename,
+                ),
               )
             } else {
-              url = result.entryUrlPlaceholder
+              urlCode = generateWorkerEntryUrlExpr(this, config, result)
             }
-            urlCode = JSON.stringify(url)
             for (const file of result.watchedFiles) {
               this.addWatchFile(file)
             }
           }
         } else {
-          let url = await fileToUrl(this, cleanUrl(id))
-          url = injectQuery(url, `${WORKER_FILE_ID}&type=${workerType}`)
+          const { file, postfix } = splitWorkerRequest(id)
+          let url = await fileToUrl(this, file, 'string')
+          url = injectQuery(
+            `${url}${postfix}`,
+            `${WORKER_FILE_ID}&type=${workerType}`,
+          )
           urlCode = JSON.stringify(url)
         }
 
@@ -515,7 +835,7 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
 
     transform: {
       filter: { id: workerFileRE },
-      async handler(raw, id) {
+      handler(raw, id) {
         const workerFileMatch = workerFileRE.exec(id)
         if (workerFileMatch) {
           // if import worker by worker constructor will have query.type
@@ -533,7 +853,7 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
             const scriptPath = JSON.stringify(ENV_PUBLIC_PATH)
             injectEnv = `import ${scriptPath}\n`
           } else if (workerType === 'ignore') {
-            if (config.isBundled) {
+            if (this.environment.config.isBundled) {
               injectEnv = ''
             } else {
               // dynamic worker type we can't know how import the env
@@ -557,78 +877,51 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
       },
     },
 
-    ...(isBuild
-      ? {
-          renderChunk(code, chunk, outputOptions) {
-            let s: MagicString
-            const result = () => {
-              return (
-                s && {
-                  code: s.toString(),
-                  map: this.environment.config.build.sourcemap
-                    ? s.generateMap({ hires: 'boundary' })
-                    : null,
-                }
-              )
-            }
-            workerAssetUrlRE.lastIndex = 0
-            if (workerAssetUrlRE.test(code)) {
-              const toRelativeRuntime =
-                createToImportMetaURLBasedRelativeRuntime(
-                  outputOptions.format,
-                  this.environment.config.isWorker,
-                )
-
-              let match: RegExpExecArray | null
-              s = new MagicString(code)
-              workerAssetUrlRE.lastIndex = 0
-
-              // Replace "__VITE_WORKER_ASSET__5aa0ddc0__" using relative paths
-              const workerOutputCache = workerOutputCaches.get(
-                config.mainConfig || config,
-              )!
-
-              while ((match = workerAssetUrlRE.exec(code))) {
-                const [full, hash] = match
-                const filename =
-                  workerOutputCache.getEntryFilenameFromHash(hash)
-                if (!filename) {
-                  this.warn(`Could not find worker asset for hash: ${hash}`)
-                  continue
-                }
-                const replacement = toOutputFilePathInJS(
-                  this.environment,
-                  filename,
-                  'asset',
-                  chunk.fileName,
-                  'js',
-                  toRelativeRuntime,
-                )
-                const replacementString =
-                  typeof replacement === 'string'
-                    ? JSON.stringify(encodeURIPath(replacement)).slice(1, -1)
-                    : `"+${replacement.runtime}+"`
-                s.update(
-                  match.index,
-                  match.index + full.length,
-                  replacementString,
-                )
-              }
-            }
-            return result()
-          },
-        }
-      : {}),
-
     generateBundle(opts, bundle) {
       // to avoid emitting duplicate assets for modern build and legacy build
-      if (
-        this.environment.config.isOutputOptionsForLegacyChunks?.(opts) ||
-        isWorker
-      ) {
+      if (this.environment.config.isOutputOptionsForLegacyChunks?.(opts)) {
         return
       }
-      for (const asset of workerOutputCaches.get(config)!.getAssets()) {
+      const cache = workerOutputCaches.get(config.mainConfig || config)!
+      const liveModuleIds = collectIncludedModuleIds(Object.values(bundle))
+      // Reference tracking relies on hooks running for every module, which is
+      // not guaranteed when an incremental build reuses cached modules.
+      const shouldFilter =
+        this.environment.config.command === 'build' && !config.build.watch
+
+      // `import.meta.ROLLDOWN_FILE_URL_*` requires calling `emitFile` while the
+      // referencing module is loaded. Remove those eagerly emitted assets when
+      // Rolldown later tree-shakes the module that referenced them. This also
+      // needs to run for worker sub-builds so dead nested workers don't become
+      // referenced assets of their parent worker bundle.
+      const rootBundleId = isWorker ? config.bundleChain.at(-1) : undefined
+      const liveFileNames = shouldFilter
+        ? cache.getLiveAssetFileNames(rootBundleId, liveModuleIds)
+        : undefined
+      if (liveFileNames) {
+        for (const workerBundle of cache.getDeadDirectlyReferencedBundles(
+          rootBundleId,
+          liveModuleIds,
+        )) {
+          // Still used through another live worker (e.g. its importer is
+          // tree-shaken here but kept in a worker).
+          if (liveFileNames.has(workerBundle.entryFilename)) continue
+          const emittedAsset = bundle[workerBundle.entryFilename]
+          if (emittedAsset?.type === 'asset') {
+            delete bundle[workerBundle.entryFilename]
+          }
+        }
+      }
+
+      if (isWorker) return
+
+      workerManifests.set(
+        this.environment,
+        cache.getChunkManifest(liveFileNames),
+      )
+
+      for (const asset of cache.getAssets()) {
+        if (liveFileNames && !liveFileNames.has(asset.fileName)) continue
         if (emittedAssets.has(asset.fileName)) continue
         emittedAssets.add(asset.fileName)
 
@@ -661,6 +954,20 @@ export function webWorkerPlugin(config: ResolvedConfig): Plugin {
         .invalidateAffectedBundles(normalizePath(file))
     },
   }
+}
+
+function collectIncludedModuleIds(
+  outputs: (OutputChunk | OutputAsset)[],
+): Set<string> {
+  const moduleIds = new Set<string>()
+  for (const output of outputs) {
+    if (output.type === 'chunk') {
+      for (const moduleId of output.moduleIds) {
+        moduleIds.add(moduleId)
+      }
+    }
+  }
+  return moduleIds
 }
 
 function isSameContent(a: string | Uint8Array, b: string | Uint8Array) {

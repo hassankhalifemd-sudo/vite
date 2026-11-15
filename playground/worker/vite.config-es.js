@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite'
-import workerPluginTestPlugin from './worker-plugin-test-plugin'
+import workerPluginTestPlugin from './worker-plugin-test-plugin.js'
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  input: command === 'serve' ? ['index.html', 'classic-esm.js'] : undefined,
   base: '/es/',
   resolve: {
     alias: {
@@ -11,7 +12,7 @@ export default defineConfig({
   worker: {
     format: 'es',
     plugins: () => [workerPluginTestPlugin()],
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         assetFileNames: 'assets/worker_asset-[name]-[hash].[ext]',
         chunkFileNames: 'assets/worker_chunk-[name]-[hash].js',
@@ -23,7 +24,8 @@ export default defineConfig({
     outDir: 'dist/es',
     assetsInlineLimit: (filePath) =>
       filePath.endsWith('.svg') ? false : undefined,
-    rollupOptions: {
+    manifest: true,
+    rolldownOptions: {
       output: {
         assetFileNames: 'assets/[name]-[hash].[ext]',
         chunkFileNames: 'assets/[name]-[hash].js',
@@ -47,4 +49,4 @@ export default defineConfig({
     },
   ],
   cacheDir: 'node_modules/.vite-es',
-})
+}))

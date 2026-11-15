@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import { port } from './serve'
 import { page } from '~utils'
+import { port } from './serve'
 
 const url = `http://localhost:${port}`
 
@@ -34,7 +34,7 @@ describe('injected inline scripts', () => {
 
     // all proxied scripts return code
     for (const code of scriptContents) {
-      expect(code).toBeTruthy()
+      expect(code).not.toBe('')
     }
   })
 })

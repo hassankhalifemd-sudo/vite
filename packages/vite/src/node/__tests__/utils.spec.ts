@@ -1,8 +1,13 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import crypto from 'node:crypto'
-import { describe, expect, test } from 'vitest'
+import fs from 'node:fs'
+import os, { type NetworkInterfaceInfoIPv4 } from 'node:os'
+import path from 'node:path'
+import type { DecodedSourceMap, RawSourceMap } from '@jridgewell/remapping'
+import MagicString from 'magic-string'
 import { fileURLToPath } from 'mlly'
+import { describe, expect, test, vi, onTestFinished } from 'vitest'
+import type { CommonServerOptions, ResolvedServerUrls } from '..'
+import { isWindows } from '../../shared/utils'
 import {
   asyncFlatten,
   bareImportRE,
@@ -11,22 +16,23 @@ import {
   extractHostnamesFromSubjectAltName,
   flattenId,
   generateCodeFrame,
+  getFileStartIndex,
   getHash,
   getLocalhostAddressIfDiffersFromDNS,
   getServerUrlByHost,
   injectQuery,
   isFileReadable,
+  isInNodeModules,
   isParentDirectory,
   mergeWithDefaults,
   normalizePath,
   numberToPos,
   posToNumber,
   processSrcSetSync,
+  removeTimestampQuery,
   resolveHostname,
   resolveServerUrls,
 } from '../utils'
-import { isWindows } from '../../shared/utils'
-import type { CommonServerOptions, ResolvedServerUrls } from '..'
 
 // Test certificate for SAN parsing (localhost, foo.localhost, *.vite.localhost)
 // Generate once:
@@ -80,6 +86,29 @@ describe('bareImportRE', () => {
   })
 })
 
+describe('isInNodeModules', () => {
+  test('should detect node_modules path segments', () => {
+    expect(isInNodeModules('/project/node_modules/foo/index.js')).toBe(true)
+    expect(isInNodeModules('node_modules/foo/index.js')).toBe(true)
+    expect(
+      isInNodeModules(
+        '/project/node_modules/.pnpm/foo@1/node_modules/foo/i.js',
+      ),
+    ).toBe(true)
+    expect(isInNodeModules('C:\\project\\node_modules\\foo\\index.js')).toBe(
+      true,
+    )
+    expect(isInNodeModules('/project/node_modules')).toBe(true)
+  })
+
+  test('should not match node_modules as part of a directory name', () => {
+    expect(isInNodeModules('/project/node_modules_bug/src/main.js')).toBe(false)
+    expect(isInNodeModules('/project/my_node_modules/src/main.js')).toBe(false)
+    expect(isInNodeModules('/project/src/node_modules.js')).toBe(false)
+    expect(isInNodeModules('C:\\node_modules_bug\\src\\main.js')).toBe(false)
+  })
+})
+
 describe('isParentDirectory', () => {
   const cases = {
     '/parent': {
@@ -111,13 +140,13 @@ describe('injectQuery', () => {
   if (isWindows) {
     // this test will work incorrectly on unix systems
     test('normalize windows path', () => {
-      expect(injectQuery('C:\\User\\Vite\\Project', 'direct')).toEqual(
+      expect(injectQuery('C:\\User\\Vite\\Project', 'direct')).toBe(
         'C:/User/Vite/Project?direct',
       )
     })
 
     test('absolute file path', () => {
-      expect(injectQuery('C:\\test-file.vue', 'direct')).toEqual(
+      expect(injectQuery('C:\\test-file.vue', 'direct')).toBe(
         'C:/test-file.vue?direct',
       )
     })
@@ -125,24 +154,24 @@ describe('injectQuery', () => {
     test('absolute file path with parameters', () => {
       expect(
         injectQuery('C:\\test-file.vue?vue&type=template&lang.js', 'direct'),
-      ).toEqual('C:/test-file.vue?direct&vue&type=template&lang.js')
+      ).toBe('C:/test-file.vue?direct&vue&type=template&lang.js')
     })
   }
 
   test('relative path', () => {
-    expect(injectQuery('usr/vite/%20a%20', 'direct')).toEqual(
+    expect(injectQuery('usr/vite/%20a%20', 'direct')).toBe(
       'usr/vite/%20a%20?direct',
     )
-    expect(injectQuery('./usr/vite/%20a%20', 'direct')).toEqual(
+    expect(injectQuery('./usr/vite/%20a%20', 'direct')).toBe(
       './usr/vite/%20a%20?direct',
     )
-    expect(injectQuery('../usr/vite/%20a%20', 'direct')).toEqual(
+    expect(injectQuery('../usr/vite/%20a%20', 'direct')).toBe(
       '../usr/vite/%20a%20?direct',
     )
   })
 
   test('path with hash', () => {
-    expect(injectQuery('/usr/vite/path with space/#1?2/', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/path with space/#1?2/', 'direct')).toBe(
       '/usr/vite/path with space/?direct#1?2/',
     )
   })
@@ -157,31 +186,31 @@ describe('injectQuery', () => {
   })
 
   test('path with multiple spaces', () => {
-    expect(injectQuery('/usr/vite/path with space', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/path with space', 'direct')).toBe(
       '/usr/vite/path with space?direct',
     )
   })
 
   test('path with multiple % characters', () => {
-    expect(injectQuery('/usr/vite/not%20a%20space', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/not%20a%20space', 'direct')).toBe(
       '/usr/vite/not%20a%20space?direct',
     )
   })
 
   test('path with %25', () => {
-    expect(injectQuery('/usr/vite/%25hello%25', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/%25hello%25', 'direct')).toBe(
       '/usr/vite/%25hello%25?direct',
     )
   })
 
   test('path with Unicode', () => {
-    expect(injectQuery('/usr/vite/東京', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/東京', 'direct')).toBe(
       '/usr/vite/東京?direct',
     )
   })
 
   test('path with Unicode, space, and %', () => {
-    expect(injectQuery('/usr/vite/東京 %20 hello', 'direct')).toEqual(
+    expect(injectQuery('/usr/vite/東京 %20 hello', 'direct')).toBe(
       '/usr/vite/東京 %20 hello?direct',
     )
   })
@@ -189,7 +218,34 @@ describe('injectQuery', () => {
   test('path with url-encoded path as query parameter', () => {
     const src = '/src/module.ts?url=https%3A%2F%2Fusr.vite%2F'
     const expected = '/src/module.ts?t=1234&url=https%3A%2F%2Fusr.vite%2F'
-    expect(injectQuery(src, 't=1234')).toEqual(expected)
+    expect(injectQuery(src, 't=1234')).toBe(expected)
+  })
+})
+
+describe('removeTimestampQuery', () => {
+  test('removes timestamp query parameter', () => {
+    expect(removeTimestampQuery('/foo.js?t=1712345678901')).toBe('/foo.js')
+    expect(removeTimestampQuery('/foo.js?t=1712345678901&bar=1')).toBe(
+      '/foo.js?bar=1',
+    )
+    expect(removeTimestampQuery('/foo.js?bar=1&t=1712345678901')).toBe(
+      '/foo.js?bar=1',
+    )
+    expect(removeTimestampQuery('/foo.js?bar=1&t=1712345678901&baz=2')).toBe(
+      '/foo.js?bar=1&baz=2',
+    )
+  })
+
+  test('does not strip params with names ending in hyphen-t', () => {
+    expect(removeTimestampQuery('/foo.js?current-t=1712345678901')).toBe(
+      '/foo.js?current-t=1712345678901',
+    )
+    expect(removeTimestampQuery('/foo.js?my-t=1712345678901&other=1')).toBe(
+      '/foo.js?my-t=1712345678901&other=1',
+    )
+    expect(removeTimestampQuery('/foo.js#t=1712345678901')).toBe(
+      '/foo.js#t=1712345678901',
+    )
   })
 })
 
@@ -197,7 +253,7 @@ describe('resolveHostname', () => {
   test('defaults to localhost', async () => {
     const resolved = await getLocalhostAddressIfDiffersFromDNS()
 
-    expect(await resolveHostname(undefined)).toEqual({
+    expect(await resolveHostname(undefined)).toStrictEqual({
       host: 'localhost',
       name: resolved ?? 'localhost',
     })
@@ -206,21 +262,21 @@ describe('resolveHostname', () => {
   test('accepts localhost', async () => {
     const resolved = await getLocalhostAddressIfDiffersFromDNS()
 
-    expect(await resolveHostname('localhost')).toEqual({
+    expect(await resolveHostname('localhost')).toStrictEqual({
       host: 'localhost',
       name: resolved ?? 'localhost',
     })
   })
 
   test('accepts 0.0.0.0', async () => {
-    expect(await resolveHostname('0.0.0.0')).toEqual({
+    expect(await resolveHostname('0.0.0.0')).toStrictEqual({
       host: '0.0.0.0',
       name: 'localhost',
     })
   })
 
   test('accepts ::', async () => {
-    expect(await resolveHostname('::')).toEqual({
+    expect(await resolveHostname('::')).toStrictEqual({
       host: '::',
       name: 'localhost',
     })
@@ -229,7 +285,7 @@ describe('resolveHostname', () => {
   test('accepts 0000:0000:0000:0000:0000:0000:0000:0000', async () => {
     expect(
       await resolveHostname('0000:0000:0000:0000:0000:0000:0000:0000'),
-    ).toEqual({
+    ).toStrictEqual({
       host: '0000:0000:0000:0000:0000:0000:0000:0000',
       name: 'localhost',
     })
@@ -277,6 +333,10 @@ describe('posToNumber', () => {
     const actual = posToNumber('a\n\nb', { line: 3, column: 0 })
     expect(actual).toBe(3)
   })
+  test('crlf', () => {
+    const actual = posToNumber('a\r\nb', { line: 2, column: 0 })
+    expect(actual).toBe(3)
+  })
   test('out of range', () => {
     const actual = posToNumber('a\nb', { line: 4, column: 0 })
     expect(actual).toBe(4)
@@ -286,23 +346,23 @@ describe('posToNumber', () => {
 describe('numberToPos', () => {
   test('simple', () => {
     const actual = numberToPos('a\nb', 2)
-    expect(actual).toEqual({ line: 2, column: 0 })
+    expect(actual).toStrictEqual({ line: 2, column: 0 })
   })
   test('pass though pos', () => {
     const actual = numberToPos('a\nb', { line: 2, column: 0 })
-    expect(actual).toEqual({ line: 2, column: 0 })
+    expect(actual).toStrictEqual({ line: 2, column: 0 })
   })
   test('empty line', () => {
     const actual = numberToPos('a\n\nb', 3)
-    expect(actual).toEqual({ line: 3, column: 0 })
+    expect(actual).toStrictEqual({ line: 3, column: 0 })
   })
   test('middle of line', () => {
     const actual = numberToPos('abc\ndef', 5)
-    expect(actual).toEqual({ line: 2, column: 1 })
+    expect(actual).toStrictEqual({ line: 2, column: 1 })
   })
   test('end of line', () => {
     const actual = numberToPos('abc\ndef', 3)
-    expect(actual).toEqual({ line: 1, column: 3 })
+    expect(actual).toStrictEqual({ line: 1, column: 3 })
   })
   test('out of range', () => {
     expect(() => numberToPos('a\nb', 5)).toThrowError(
@@ -335,7 +395,9 @@ foo()
       expect('\n' + value + '\n').toMatchSnapshot()
     } catch (e) {
       // don't include this function in stacktrace
-      Error.captureStackTrace(e, expectSnapshot)
+      if (e instanceof Error) {
+        Error.captureStackTrace(e, expectSnapshot)
+      }
       throw e
     }
   }
@@ -355,6 +417,25 @@ foo()
 
   test('works with CRLF', () => {
     expectSnapshot(generateCodeFrame(sourceCrLf, { line: 2, column: 0 }))
+  })
+
+  test('works with CRLF given an offset', () => {
+    const longSourceCrLf = longSource.replaceAll('\n', '\r\n')
+    // the frame should point to the same location regardless of the line endings
+    expect(
+      generateCodeFrame(longSourceCrLf, longSourceCrLf.indexOf('// 3')),
+    ).toBe(generateCodeFrame(longSource, longSource.indexOf('// 3')))
+  })
+
+  test('works with CRLF given a range', () => {
+    const longSourceCrLf = longSource.replaceAll('\n', '\r\n')
+    expectSnapshot(
+      generateCodeFrame(
+        longSourceCrLf,
+        longSourceCrLf.indexOf('foo()'),
+        longSourceCrLf.indexOf('// 2'),
+      ),
+    )
   })
 
   test('end', () => {
@@ -452,6 +533,33 @@ foo()
   })
 })
 
+describe('getFileStartIndex', () => {
+  const LINE_TERMINATORS = {
+    LF: '\n',
+    CRLF: '\r\n',
+    CR: '\r',
+    'LINE SEPARATOR': '\u2028',
+    'PARAGRAPH SEPARATOR': '\u2029',
+  }
+  for (const [terminatorName, terminator] of Object.entries(LINE_TERMINATORS)) {
+    test(`returns the index after a hashbang ending in ${terminatorName}`, () => {
+      const hashbang = `#!/usr/bin/env node${terminator}`
+      expect(getFileStartIndex(`${hashbang}console.log(1)`)).toBe(
+        hashbang.length,
+      )
+    })
+  }
+
+  test('returns the end of an unterminated hashbang', () => {
+    const code = '#!/usr/bin/env node'
+    expect(getFileStartIndex(code)).toBe(code.length)
+  })
+
+  test('returns zero without a hashbang', () => {
+    expect(getFileStartIndex('console.log(1)')).toBe(0)
+  })
+})
+
 describe('getHash', () => {
   test('8-digit hex', () => {
     const hash = getHash(Buffer.alloc(0))
@@ -462,22 +570,22 @@ describe('getHash', () => {
 describe('asyncFlatten', () => {
   test('plain array', async () => {
     const arr = await asyncFlatten([1, 2, 3])
-    expect(arr).toEqual([1, 2, 3])
+    expect(arr).toStrictEqual([1, 2, 3])
   })
 
   test('nested array', async () => {
     const arr = await asyncFlatten([1, 2, 3, [4, 5, 6]])
-    expect(arr).toEqual([1, 2, 3, 4, 5, 6])
+    expect(arr).toStrictEqual([1, 2, 3, 4, 5, 6])
   })
 
   test('nested falsy array', async () => {
     const arr = await asyncFlatten([1, 2, false, [4, null, undefined]])
-    expect(arr).toEqual([1, 2, false, 4, null, undefined])
+    expect(arr).toStrictEqual([1, 2, false, 4, null, undefined])
   })
 
   test('plain promise array', async () => {
     const arr = await asyncFlatten([1, 2, Promise.resolve(3)])
-    expect(arr).toEqual([1, 2, 3])
+    expect(arr).toStrictEqual([1, 2, 3])
   })
 
   test('nested promise array', async () => {
@@ -487,7 +595,7 @@ describe('asyncFlatten', () => {
       Promise.resolve(3),
       Promise.resolve([4, 5, 6]),
     ])
-    expect(arr).toEqual([1, 2, 3, 4, 5, 6])
+    expect(arr).toStrictEqual([1, 2, 3, 4, 5, 6])
   })
 
   test('2x nested promise array', async () => {
@@ -497,7 +605,7 @@ describe('asyncFlatten', () => {
       Promise.resolve(3),
       Promise.resolve([4, 5, Promise.resolve(6), Promise.resolve([7, 8, 9])]),
     ])
-    expect(arr).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    expect(arr).toStrictEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
   })
 })
 
@@ -506,8 +614,10 @@ describe('isFileReadable', () => {
     expect(isFileReadable('/does_not_exist')).toBe(false)
   })
 
-  const testFile =
-    require.resolve('./utils/isFileReadable/permission-test-file')
+  const testFile = path.resolve(
+    import.meta.dirname,
+    './utils/isFileReadable/permission-test-file',
+  )
   test('file with normal permission', async () => {
     expect(isFileReadable(testFile)).toBe(true)
   })
@@ -559,6 +669,26 @@ describe('processSrcSetSync', () => {
     ).toBe('"/base/nested/asset.png" 1x, "/base/nested/asset.png" 2x')
   })
 
+  test('keep the url when a density descriptor omits its leading zero', async () => {
+    const devBase = '/base/'
+    expect(
+      processSrcSetSync(
+        './nested/asset.png .5x, ./nested/asset.png 1x',
+        ({ url }) => path.posix.join(devBase, url),
+      ),
+    ).toBe('/base/nested/asset.png .5x, /base/nested/asset.png 1x')
+  })
+
+  test('keep the quoted url when a density descriptor omits its leading zero', async () => {
+    const devBase = '/base/'
+    expect(
+      processSrcSetSync(
+        '"./nested/asset.png" .75x,"./nested/asset.png" 1x',
+        ({ url }) => `"${path.posix.join(devBase, url.slice(1, -1))}"`,
+      ),
+    ).toBe('"/base/nested/asset.png" .75x, "/base/nested/asset.png" 1x')
+  })
+
   test('should not split the comma inside base64 value', async () => {
     const base64 =
       'data:image/avif;base64,aA+/0= 400w, data:image/avif;base64,bB+/9= 800w'
@@ -593,6 +723,18 @@ describe('processSrcSetSync', () => {
     `
     const result =
       'https://example.com/dpr_1,f_auto,fl_progressive,q_auto,w_100/v1/img 1x, https://example.com/dpr_2,f_auto,fl_progressive,q_auto,w_100/v1/img 2x'
+    expect(processSrcSetSync(source, ({ url }) => url)).toBe(result)
+  })
+
+  test('should convert newline-separated srcset candidates to space-separated', async () => {
+    const source = 'asset.png\n1x,\nnested/asset.png\n2x'
+    const result = 'asset.png 1x, nested/asset.png 2x'
+    expect(processSrcSetSync(source, ({ url }) => url)).toBe(result)
+  })
+
+  test('should convert CRLF-separated srcset candidates to space-separated', async () => {
+    const source = 'asset.png\r\n1x,\r\nnested/asset.png\r\n2x'
+    const result = 'asset.png 1x, nested/asset.png 2x'
     expect(processSrcSetSync(source, ({ url }) => url)).toBe(result)
   })
 
@@ -647,7 +789,7 @@ describe('processSrcSetSync', () => {
       result.push(url)
       return url
     })
-    expect(result).toEqual(expected)
+    expect(result).toStrictEqual(expected)
   })
 })
 
@@ -761,6 +903,28 @@ describe('combineSourcemaps', () => {
   const resolveFile = (file: string) => {
     return normalizePath(path.resolve(_dirname, file))
   }
+
+  test('composes decoded intermediate mappings identically', () => {
+    const filename = 'assets/index.js'
+    const s = new MagicString('export const value = 1')
+    const originalMap = s.generateMap({
+      source: filename,
+      hires: true,
+      includeContent: true,
+    })
+    const options = { source: filename, hires: 'boundary' as const }
+    const encoded = combineSourcemaps(filename, [
+      s.generateMap(options) as RawSourceMap,
+      originalMap as RawSourceMap,
+    ])
+    const decoded = combineSourcemaps(filename, [
+      s.generateDecodedMap(options) as DecodedSourceMap,
+      originalMap as RawSourceMap,
+    ])
+
+    expect(decoded).toStrictEqual(encoded)
+    expect(decoded.sourcesContent).toStrictEqual(originalMap.sourcesContent)
+  })
 
   test('should combine sourcemaps with single sources', () => {
     const sourcemaps = [
@@ -1093,5 +1257,122 @@ describe('resolveServerUrls', () => {
     )
 
     expect(result.local).toContain('https://localhost:3000/')
+  })
+
+  test('captures interface names aligned with the network URLs', () => {
+    const mockServer = createMockServer('IPv4', '0.0.0.0')
+    const networkInterfacesSpy = vi
+      .spyOn(os, 'networkInterfaces')
+      .mockReturnValue({
+        lo: [
+          { address: '127.0.0.1', family: 'IPv4' } as NetworkInterfaceInfoIPv4,
+        ],
+        eth0: [
+          {
+            address: '192.168.1.10',
+            family: 'IPv4',
+          } as NetworkInterfaceInfoIPv4,
+        ],
+        wlan0: [
+          { address: '10.0.0.5', family: 'IPv4' } as NetworkInterfaceInfoIPv4,
+        ],
+      })
+    onTestFinished(() => {
+      networkInterfacesSpy.mockRestore()
+    })
+
+    const result = resolveServerUrls(
+      mockServer,
+      { https: false } as any,
+      { host: undefined, name: 'localhost' } as any,
+      {},
+      { rawBase: '/' } as any,
+    )
+
+    expect(result.network).toStrictEqual([
+      'http://192.168.1.10:3000/',
+      'http://10.0.0.5:3000/',
+    ])
+    expect(result.networkInterfaceNames).toStrictEqual(['eth0', 'wlan0'])
+    expect(result.networkInterfaceNames).toHaveLength(result.network.length)
+    // The loopback interface is reported as a local URL, not a network one.
+    expect(result.local).toContain('http://localhost:3000/')
+  })
+
+  test('uses an undefined interface name for an explicit network host', () => {
+    const mockServer = createMockServer('IPv4', '0.0.0.0')
+
+    const result = resolveServerUrls(
+      mockServer,
+      { https: false } as any,
+      { host: 'example.com', name: 'example.com' } as any,
+      {},
+      { rawBase: '/' } as any,
+    )
+
+    expect(result.network).toStrictEqual(['http://example.com:3000/'])
+    expect(result.networkInterfaceNames).toStrictEqual([undefined])
+  })
+
+  test('resolves interface name for an explicit host IP that matches a network interface', () => {
+    const mockServer = createMockServer('IPv4', '0.0.0.0')
+    const networkInterfacesSpy = vi
+      .spyOn(os, 'networkInterfaces')
+      .mockReturnValue({
+        lo: [
+          { address: '127.0.0.1', family: 'IPv4' } as NetworkInterfaceInfoIPv4,
+        ],
+        eth0: [
+          {
+            address: '192.168.1.10',
+            family: 'IPv4',
+          } as NetworkInterfaceInfoIPv4,
+        ],
+      })
+    onTestFinished(() => {
+      networkInterfacesSpy.mockRestore()
+    })
+
+    const result = resolveServerUrls(
+      mockServer,
+      { https: false } as any,
+      { host: '192.168.1.10', name: '192.168.1.10' } as any,
+      {},
+      { rawBase: '/' } as any,
+    )
+
+    expect(result.network).toStrictEqual(['http://192.168.1.10:3000/'])
+    expect(result.networkInterfaceNames).toStrictEqual(['eth0'])
+  })
+
+  test('uses undefined interface name when explicit host IP does not match any interface', () => {
+    const mockServer = createMockServer('IPv4', '0.0.0.0')
+    const networkInterfacesSpy = vi
+      .spyOn(os, 'networkInterfaces')
+      .mockReturnValue({
+        lo: [
+          { address: '127.0.0.1', family: 'IPv4' } as NetworkInterfaceInfoIPv4,
+        ],
+        eth0: [
+          {
+            address: '192.168.1.10',
+            family: 'IPv4',
+          } as NetworkInterfaceInfoIPv4,
+        ],
+      })
+    onTestFinished(() => {
+      networkInterfacesSpy.mockRestore()
+    })
+
+    const result = resolveServerUrls(
+      mockServer,
+      { https: false } as any,
+      { host: '10.0.0.5', name: '10.0.0.5' } as any,
+      {},
+      { rawBase: '/' } as any,
+    )
+
+    expect(result.network).toStrictEqual(['http://10.0.0.5:3000/'])
+    expect(result.networkInterfaceNames).toStrictEqual([undefined])
   })
 })

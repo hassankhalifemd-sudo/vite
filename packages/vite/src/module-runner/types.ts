@@ -1,9 +1,6 @@
+import type { DevRuntime } from 'rolldown/experimental/runtime-types'
 import type { ViteHotContext } from '#types/hot'
 import type { HMRLogger } from '../shared/hmr'
-import type {
-  DefineImportMetadata,
-  SSRImportMetadata,
-} from '../shared/ssrTransform'
 import type {
   ExternalFetchResult,
   FetchFunctionOptions,
@@ -11,7 +8,10 @@ import type {
   ViteFetchResult,
 } from '../shared/invokeMethods'
 import type { ModuleRunnerTransport } from '../shared/moduleRunnerTransport'
-import type { EvaluatedModuleNode, EvaluatedModules } from './evaluatedModules'
+import type {
+  DefineImportMetadata,
+  SSRImportMetadata,
+} from '../shared/ssrTransform'
 import type {
   ssrDynamicImportKey,
   ssrExportAllKey,
@@ -19,7 +19,9 @@ import type {
   ssrImportKey,
   ssrImportMetaKey,
   ssrModuleExportsKey,
+  ssrRolldownRuntimeKey,
 } from './constants'
+import type { EvaluatedModuleNode, EvaluatedModules } from './evaluatedModules'
 import type { InterceptorOptions } from './sourcemap/interceptor'
 
 export type { DefineImportMetadata, SSRImportMetadata }
@@ -45,6 +47,10 @@ export interface ModuleRunnerContext {
   [ssrExportAllKey]: (obj: any) => void
   [ssrExportNameKey]: (name: string, getter: () => unknown) => void
   [ssrImportMetaKey]: ModuleRunnerImportMeta
+  /**
+   * @internal
+   */
+  [ssrRolldownRuntimeKey]: DevRuntime | undefined
 }
 
 export interface ModuleEvaluator {
@@ -86,6 +92,11 @@ export interface ModuleRunnerHmr {
    * Configure HMR logger.
    */
   logger?: false | HMRLogger
+  /**
+   * Enable partial acceptance of exports in bundled mode.
+   * @default false
+   */
+  partialAccept?: boolean
 }
 
 export interface ModuleRunnerOptions {
@@ -121,6 +132,14 @@ export interface ModuleRunnerOptions {
    * Custom module cache. If not provided, creates a separate module cache for each ModuleRunner instance.
    */
   evaluatedModules?: EvaluatedModules
+  /**
+   * The modules are served as a rolldown bundle that ships its own dev runtime,
+   * instead of one module at a time. HMR is then driven by the runtime's module
+   * graph rather than by the server's.
+   *
+   * @default false
+   */
+  rolldownRuntime?: boolean
 }
 
 export interface ImportMetaEnv {

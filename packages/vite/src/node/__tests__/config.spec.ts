@@ -1,13 +1,221 @@
-import http from 'node:http'
-import path from 'node:path'
 import fs from 'node:fs'
-import { afterEach, describe, expect, test, vi } from 'vitest'
-import type { InlineConfig, PluginOption } from '..'
+import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import { stripVTControlCharacters } from 'node:util'
+import { afterEach, assert, describe, expect, test, vi } from 'vitest'
+import type { InlineConfig, Plugin, PluginOption } from '..'
+import { isWindows } from '../../shared/utils'
 import type { UserConfig, UserConfigExport } from '../config'
-import { defineConfig, loadConfigFromFile, resolveConfig } from '../config'
+import {
+  bundleConfigFile,
+  defineConfig,
+  loadConfigFromFile,
+  resolveConfig,
+} from '../config'
 import { resolveEnvPrefix } from '../env'
-import { hasBothRollupOptionsAndRolldownOptions, mergeConfig } from '../utils'
 import { createLogger } from '../logger'
+import type { Logger } from '../logger'
+import { resolveServerOptions } from '../server'
+import {
+  hasBothRollupOptionsAndRolldownOptions,
+  mergeConfig,
+  normalizePath,
+} from '../utils'
+
+const devToolsIntegration = vi.hoisted(() => vi.fn())
+
+vi.mock('@vitejs/devtools/integration', () => ({
+  DevToolsIntegration: devToolsIntegration,
+}))
+
+describe('DevTools plugin resolution', () => {
+  afterEach(() => {
+    devToolsIntegration.mockReset()
+  })
+
+  test('uses the standard plugin lifecycle and exposes the resolved config', async () => {
+    const configHooks: string[] = []
+    const plugin = (
+      name: string,
+      enforce?: 'pre' | 'post',
+      apply?: 'serve' | 'build',
+      config?: InlineConfig,
+    ): Plugin => ({
+      name,
+      enforce,
+      apply,
+      config() {
+        configHooks.push(name)
+        return config
+      },
+    })
+
+    devToolsIntegration.mockResolvedValueOnce([
+      plugin('devtools-pre', 'pre'),
+      plugin('devtools-normal'),
+      plugin('devtools-post', 'post'),
+      plugin('devtools-build-only', undefined, 'build'),
+    ])
+
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        devtools: true,
+        plugins: [
+          plugin('user-pre', 'pre'),
+          plugin('user-normal'),
+          plugin('user-post', 'post'),
+        ],
+      },
+      'serve',
+    )
+
+    expect(devToolsIntegration).toHaveBeenCalledWith({
+      command: 'serve',
+      devtools: {
+        options: true,
+      },
+    })
+    expect(configHooks).toStrictEqual([
+      'user-pre',
+      'devtools-pre',
+      'user-normal',
+      'devtools-normal',
+      'user-post',
+      'devtools-post',
+    ])
+    expect(config.devtools).toMatchObject({
+      apply: 'all',
+      enabled: true,
+    })
+
+    const pluginNames = config.plugins.map((plugin) => plugin.name)
+    expect(pluginNames).not.toContain('devtools-build-only')
+    expect(pluginNames.indexOf('user-pre')).toBeLessThan(
+      pluginNames.indexOf('devtools-pre'),
+    )
+    expect(pluginNames.indexOf('user-normal')).toBeLessThan(
+      pluginNames.indexOf('devtools-normal'),
+    )
+    expect(pluginNames.indexOf('user-post')).toBeLessThan(
+      pluginNames.indexOf('devtools-post'),
+    )
+  })
+
+  test('does not allow a plugin config hook to enable DevTools', async () => {
+    const logger = createLogger('silent')
+    const warn = vi.spyOn(logger, 'warn')
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        customLogger: logger,
+        plugins: [
+          {
+            name: 'enable-devtools',
+            config: () => ({ devtools: true }),
+          },
+        ],
+      },
+      'serve',
+    )
+
+    expect(config.devtools).toBe(false)
+    expect(devToolsIntegration).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "The `devtools` option cannot be changed from a plugin's `config` hook.",
+      ),
+    )
+  })
+
+  test('does not allow a plugin config hook to disable DevTools', async () => {
+    const logger = createLogger('silent')
+    const warn = vi.spyOn(logger, 'warn')
+    devToolsIntegration.mockResolvedValueOnce([])
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        customLogger: logger,
+        devtools: true,
+        plugins: [
+          {
+            name: 'disable-devtools',
+            config: () => ({ devtools: false }),
+          },
+        ],
+      },
+      'serve',
+    )
+
+    expect(config.devtools).toMatchObject({ enabled: true })
+    expect(devToolsIntegration).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "The `devtools` option cannot be changed from a plugin's `config` hook.",
+      ),
+    )
+  })
+
+  test('does not allow a plugin config hook to mutate DevTools options in place', async () => {
+    const logger = createLogger('silent')
+    const warn = vi.spyOn(logger, 'warn')
+    devToolsIntegration.mockResolvedValueOnce([])
+    const devtools = { enabled: true }
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        customLogger: logger,
+        devtools,
+        plugins: [
+          {
+            name: 'mutate-devtools',
+            config() {
+              devtools.enabled = false
+            },
+          },
+        ],
+      },
+      'serve',
+    )
+
+    expect(config.devtools).toMatchObject({ enabled: true })
+    expect(devToolsIntegration).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "The `devtools` option cannot be changed from a plugin's `config` hook.",
+      ),
+    )
+  })
+
+  test('does not allow a plugin config hook to change non-enablement DevTools options', async () => {
+    const logger = createLogger('silent')
+    const warn = vi.spyOn(logger, 'warn')
+    devToolsIntegration.mockResolvedValueOnce([])
+    const config = await resolveConfig(
+      {
+        configFile: false,
+        customLogger: logger,
+        devtools: { apply: 'serve' },
+        plugins: [
+          {
+            name: 'change-devtools-options',
+            config: () => ({ devtools: { apply: 'build' } }),
+          },
+        ],
+      },
+      'serve',
+    )
+
+    expect(config.devtools).toMatchObject({ apply: 'serve' })
+    expect(devToolsIntegration).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "The `devtools` option cannot be changed from a plugin's `config` hook.",
+      ),
+    )
+  })
+})
 
 describe('mergeConfig', () => {
   test('handles configs with different alias schemas', () => {
@@ -50,7 +258,7 @@ describe('mergeConfig', () => {
       },
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('keep object alias schema', () => {
@@ -82,7 +290,7 @@ describe('mergeConfig', () => {
       },
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('handles arrays', () => {
@@ -98,7 +306,7 @@ describe('mergeConfig', () => {
       envPrefix: ['string1', 'string2', 'string3'],
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('handles assetsInclude', () => {
@@ -114,7 +322,108 @@ describe('mergeConfig', () => {
       assetsInclude: ['some-string', 'some-other-string', /regexp?/],
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
+  })
+
+  test('handles input', () => {
+    const cases: {
+      name: string
+      a: UserConfig['input']
+      b: UserConfig['input']
+      expected: UserConfig['input']
+    }[] = [
+      {
+        name: 'string + string',
+        a: 'src/a.ts',
+        b: 'src/b.ts',
+        expected: ['src/a.ts', 'src/b.ts'],
+      },
+      {
+        name: 'array + string',
+        a: ['src/a.ts'],
+        b: 'src/b.ts',
+        expected: ['src/a.ts', 'src/b.ts'],
+      },
+      {
+        name: 'string + array',
+        a: 'src/a.ts',
+        b: ['src/b.ts'],
+        expected: ['src/a.ts', 'src/b.ts'],
+      },
+      {
+        name: 'array + array',
+        a: ['src/a.ts'],
+        b: ['src/b.ts'],
+        expected: ['src/a.ts', 'src/b.ts'],
+      },
+      {
+        name: 'object + object',
+        a: { a: 'src/a.ts', shared: 'src/old.ts' },
+        b: { b: 'src/b.ts', shared: 'src/new.ts' },
+        expected: { a: 'src/a.ts', b: 'src/b.ts', shared: 'src/new.ts' },
+      },
+      {
+        name: 'string + object',
+        a: 'src/a.ts',
+        b: { b: 'src/b.ts' },
+        expected: { a: 'src/a.ts', b: 'src/b.ts' },
+      },
+      {
+        name: 'object + string',
+        a: { a: 'src/a.ts' },
+        b: 'src/b.ts',
+        expected: { a: 'src/a.ts', b: 'src/b.ts' },
+      },
+      {
+        name: 'array + object',
+        a: ['src/a.ts'],
+        b: { b: 'src/b.ts' },
+        expected: { a: 'src/a.ts', b: 'src/b.ts' },
+      },
+      {
+        name: 'only a',
+        a: 'src/a.ts',
+        b: undefined,
+        expected: 'src/a.ts',
+      },
+      {
+        name: 'only b',
+        a: undefined,
+        b: 'src/b.ts',
+        expected: 'src/b.ts',
+      },
+    ]
+
+    for (const { name, a, b, expected } of cases) {
+      expect(mergeConfig({ input: a }, { input: b }), name).toStrictEqual({
+        input: expected,
+      })
+    }
+  })
+
+  test('not handles input not at top level', () => {
+    const baseConfig = {
+      build: {
+        input: 'src/a.ts',
+      },
+    }
+
+    const newConfig = {
+      build: {
+        input: 'src/b.ts',
+      },
+    }
+
+    // nested `input` is overwritten, not merged
+    const mergedConfig = {
+      build: {
+        input: 'src/b.ts',
+        rolldownOptions: undefined,
+        rollupOptions: undefined,
+      },
+    }
+
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('not handles alias not under `resolve`', () => {
@@ -146,7 +455,7 @@ describe('mergeConfig', () => {
       },
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('merge array correctly', () => {
@@ -162,7 +471,7 @@ describe('mergeConfig', () => {
       foo: ['bar'],
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('handles ssr.noExternal', () => {
@@ -188,8 +497,8 @@ describe('mergeConfig', () => {
     }
 
     // merging either ways, `ssr.noExternal: true` should take highest priority
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
-    expect(mergeConfig(newConfig, baseConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
+    expect(mergeConfig(newConfig, baseConfig)).toStrictEqual(mergedConfig)
   })
 
   test('handles environments.*.resolve.noExternal', () => {
@@ -224,8 +533,8 @@ describe('mergeConfig', () => {
     }
 
     // merging either ways, `resolve.noExternal: true` should take highest priority
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
-    expect(mergeConfig(newConfig, baseConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
+    expect(mergeConfig(newConfig, baseConfig)).toStrictEqual(mergedConfig)
   })
 
   test('merge ssr.noExternal and environments.ssr.resolve.noExternal', async () => {
@@ -244,7 +553,7 @@ describe('mergeConfig', () => {
       },
       'serve',
     )
-    expect(oldTrue.environments.ssr.resolve.noExternal).toEqual(true)
+    expect(oldTrue.environments.ssr.resolve.noExternal).toBe(true)
 
     const newTrue = await resolveConfig(
       {
@@ -261,19 +570,19 @@ describe('mergeConfig', () => {
       },
       'serve',
     )
-    expect(newTrue.environments.ssr.resolve.noExternal).toEqual(true)
+    expect(newTrue.environments.ssr.resolve.noExternal).toBe(true)
   })
 
-  test('handles server.hmr.server', () => {
+  test('handles server.ws.server', () => {
     const httpServer = http.createServer()
 
-    const baseConfig = { server: { hmr: { server: httpServer } } }
-    const newConfig = { server: { hmr: { server: httpServer } } }
+    const baseConfig = { server: { ws: { server: httpServer } } }
+    const newConfig = { server: { ws: { server: httpServer } } }
 
     const mergedConfig = mergeConfig(baseConfig, newConfig)
 
     // Server instance should not be recreated
-    expect(mergedConfig.server.hmr.server).toBe(httpServer)
+    expect(mergedConfig.server.ws.server).toBe(httpServer)
   })
 
   test('handles server.allowedHosts', () => {
@@ -286,10 +595,14 @@ describe('mergeConfig', () => {
     }
 
     const mergedConfig = {
-      server: { allowedHosts: true },
+      server: {
+        allowedHosts: true,
+        hmr: expect.any(Object),
+        ws: expect.any(Object),
+      },
     }
 
-    expect(mergeConfig(baseConfig, newConfig)).toEqual(mergedConfig)
+    expect(mergeConfig(baseConfig, newConfig)).toStrictEqual(mergedConfig)
   })
 
   test('throws error with functions', () => {
@@ -313,26 +626,26 @@ describe('mergeConfig', () => {
     ).toThrowError('Cannot merge config in form of callback')
   })
 
-  test('handles `rollupOptions`', () => {
+  test('handles `rolldownOptions`', () => {
     const baseConfig = defineConfig({
       build: {
-        rollupOptions: {
+        rolldownOptions: {
           treeshake: false,
         },
       },
       worker: {
-        rollupOptions: {
+        rolldownOptions: {
           treeshake: false,
         },
       },
       optimizeDeps: {
-        rollupOptions: {
+        rolldownOptions: {
           treeshake: false,
         },
       },
       ssr: {
         optimizeDeps: {
-          rollupOptions: {
+          rolldownOptions: {
             treeshake: false,
           },
         },
@@ -341,21 +654,21 @@ describe('mergeConfig', () => {
 
     const newConfig = defineConfig({
       build: {
-        rollupOptions: {
+        rolldownOptions: {
           output: {
             minifyInternalExports: true,
           },
         },
       },
       worker: {
-        rollupOptions: {
+        rolldownOptions: {
           output: {
             minifyInternalExports: true,
           },
         },
       },
       optimizeDeps: {
-        rollupOptions: {
+        rolldownOptions: {
           output: {
             minifyInternalExports: true,
           },
@@ -363,7 +676,7 @@ describe('mergeConfig', () => {
       },
       ssr: {
         optimizeDeps: {
-          rollupOptions: {
+          rolldownOptions: {
             output: {
               minifyInternalExports: true,
             },
@@ -384,9 +697,7 @@ describe('mergeConfig', () => {
     expect(mergedConfig.build.rolldownOptions).toStrictEqual(expected)
     expect(mergedConfig.worker.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.worker.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.optimizeDeps.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.optimizeDeps.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.ssr.optimizeDeps.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.ssr.optimizeDeps.rolldownOptions).toStrictEqual(
       expected,
     )
@@ -463,9 +774,7 @@ describe('mergeConfig', () => {
     expect(mergedConfig.build.rolldownOptions).toStrictEqual(expected)
     expect(mergedConfig.worker.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.worker.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.optimizeDeps.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.optimizeDeps.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.ssr.optimizeDeps.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.ssr.optimizeDeps.rolldownOptions).toStrictEqual(
       expected,
     )
@@ -481,18 +790,6 @@ describe('mergeConfig', () => {
       worker: {
         rollupOptions: {
           treeshake: false,
-        },
-      },
-      optimizeDeps: {
-        rollupOptions: {
-          treeshake: false,
-        },
-      },
-      ssr: {
-        optimizeDeps: {
-          rollupOptions: {
-            treeshake: false,
-          },
         },
       },
     })
@@ -512,22 +809,6 @@ describe('mergeConfig', () => {
           },
         },
       },
-      optimizeDeps: {
-        rolldownOptions: {
-          output: {
-            minifyInternalExports: true,
-          },
-        },
-      },
-      ssr: {
-        optimizeDeps: {
-          rollupOptions: {
-            output: {
-              minifyInternalExports: true,
-            },
-          },
-        },
-      },
     })
 
     const mergedConfig = mergeConfig(baseConfig, newConfig) as UserConfig
@@ -542,15 +823,6 @@ describe('mergeConfig', () => {
     expect(mergedConfig.build!.rolldownOptions).toStrictEqual(expected)
     expect(mergedConfig.worker!.rollupOptions).toStrictEqual(expected)
     expect(mergedConfig.worker!.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.optimizeDeps!.rollupOptions).toStrictEqual(expected)
-    expect(mergedConfig.optimizeDeps!.rolldownOptions).toStrictEqual(expected)
-    expect(mergedConfig.ssr!.optimizeDeps!.rollupOptions).toStrictEqual(
-      expected,
-    )
-    expect(mergedConfig.ssr!.optimizeDeps!.rolldownOptions).toStrictEqual(
-      expected,
-    )
-
     const upOutput = mergedConfig.build!.rollupOptions!.output!
     if (Array.isArray(upOutput)) throw new Error()
     const downOutput = mergedConfig.build!.rolldownOptions!.output!
@@ -656,6 +928,193 @@ describe('mergeConfig', () => {
     expect(
       testRolldownOptions.environments.client.build.rolldownOptions.platform,
     ).toBe('browser')
+  })
+
+  test('resolved build options keep rollupOptions as a live proxy of rolldownOptions', async () => {
+    const config = await resolveConfig({}, 'serve')
+
+    for (const build of [
+      config.build,
+      config.environments.client.build,
+      config.environments.ssr.build,
+    ]) {
+      // Reassigning `rolldownOptions` must be reflected through the `rollupOptions` getter.
+      const newOptions = { treeshake: false }
+      build.rolldownOptions = newOptions
+      expect(build.rollupOptions).toBe(newOptions)
+
+      // Assigning through `rollupOptions` must update `rolldownOptions` too.
+      const newerOptions = { treeshake: true }
+      build.rollupOptions = newerOptions
+      expect(build.rolldownOptions).toBe(newerOptions)
+    }
+  })
+
+  test('syncs `server.hmr.*` to `server.ws.*`', () => {
+    const baseConfig = defineConfig({
+      server: {
+        hmr: {
+          protocol: 'wss',
+          host: 'example.com',
+          port: 3001,
+          clientPort: 443,
+          path: '/ws',
+          timeout: 60000,
+        },
+      },
+    })
+
+    const mergedConfig = mergeConfig(
+      {
+        server: { ws: {} },
+      },
+      baseConfig,
+    )
+
+    expect(mergedConfig.server.ws).toStrictEqual({
+      protocol: 'wss',
+      host: 'example.com',
+      port: 3001,
+      clientPort: 443,
+      path: '/ws',
+      timeout: 60000,
+    })
+    expect(mergedConfig.server.hmr).toStrictEqual({
+      protocol: 'wss',
+      host: 'example.com',
+      port: 3001,
+      clientPort: 443,
+      path: '/ws',
+      timeout: 60000,
+      server: undefined,
+    })
+  })
+
+  test('mergeConfig works with `server.ws` and `server.hmr`', () => {
+    const baseConfig = defineConfig({
+      server: {
+        ws: {
+          host: 'old-host.com',
+          port: 3001,
+        },
+      },
+    })
+
+    const newConfig = defineConfig({
+      server: {
+        hmr: {
+          host: 'new-host.com',
+          port: 3002,
+        },
+      },
+    })
+
+    const mergedConfig = mergeConfig(baseConfig, newConfig)
+
+    expect(mergedConfig.server.ws.host).toBe('new-host.com')
+    expect(mergedConfig.server.hmr.host).toBe('new-host.com')
+    expect(mergedConfig.server.ws.port).toBe(3002)
+    expect(mergedConfig.server.hmr.port).toBe(3002)
+  })
+
+  test('mergeConfig does not mutate `server.hmr` defaults', () => {
+    const defaults = {
+      server: {
+        hmr: {
+          host: 'localhost',
+        },
+      },
+    }
+
+    mergeConfig(defaults, {
+      server: {
+        hmr: {
+          port: 3000,
+        },
+      },
+    })
+
+    expect(defaults.server.hmr).toStrictEqual({ host: 'localhost' })
+    expect(Object.hasOwn(defaults.server.hmr, 'port')).toBe(false)
+
+    const secondMerge = mergeConfig(defaults, {
+      server: {
+        hmr: {
+          protocol: 'wss',
+        },
+      },
+    })
+
+    expect(secondMerge.server.ws).toStrictEqual({
+      host: 'localhost',
+      protocol: 'wss',
+    })
+  })
+
+  test('`server.hmr.overlay` is not mapped to `server.ws.overlay`', () => {
+    const config = mergeConfig(
+      {},
+      defineConfig({
+        server: {
+          hmr: {
+            overlay: false,
+          },
+        },
+      }),
+    )
+
+    expect(config.server.hmr.overlay).toBe(false)
+    // overlay should not be synced to ws
+    expect(config.server.ws?.overlay).toBeUndefined()
+  })
+
+  test('`mergeConfig` does not crash when `server.ws` is false and `server.hmr` is merged', () => {
+    const baseConfig = defineConfig({
+      server: {
+        ws: false,
+        hmr: {
+          host: 'localhost',
+        },
+      },
+    })
+
+    const newConfig = defineConfig({
+      server: {
+        hmr: {
+          port: 5173,
+        },
+      },
+    })
+
+    const mergedConfig = mergeConfig(baseConfig, newConfig)
+
+    expect(mergedConfig.server.ws).toBe(false)
+    expect(mergedConfig.server.hmr).toBeTypeOf('object')
+    expect(mergedConfig.server.hmr).not.toBeNull()
+  })
+
+  test('resolveConfig properly syncs hmr and ws', async () => {
+    const config = await resolveConfig(
+      {
+        server: {
+          hmr: {
+            host: 'test-host.com',
+            port: 4000,
+          },
+        },
+      },
+      'serve',
+    )
+
+    assert(typeof config.server.ws === 'object')
+    expect(config.server.ws.host).toBe('test-host.com')
+    expect(config.server.ws.port).toBe(4000)
+
+    assert(typeof config.server.hmr === 'object')
+    config.server.hmr!.host = 'new-host.com'
+
+    expect(config.server.ws.host).toBe('new-host.com')
+    expect(config.server.hmr.host).toBe('new-host.com')
   })
 
   describe('later plugin can read `rollupOptions` set via `rolldownOptions` in earlier plugin', () => {
@@ -778,9 +1237,13 @@ describe('resolveEnvPrefix', () => {
 
   test(`throw error if envPrefix contains ''`, () => {
     let config: UserConfig = { envPrefix: '' }
-    expect(() => resolveEnvPrefix(config)).toThrow()
+    expect(() => resolveEnvPrefix(config)).toThrow(
+      'could lead unexpected exposure of sensitive information',
+    )
     config = { envPrefix: ['', 'CUSTOM_'] }
-    expect(() => resolveEnvPrefix(config)).toThrow()
+    expect(() => resolveEnvPrefix(config)).toThrow(
+      'could lead unexpected exposure of sensitive information',
+    )
   })
 
   test(`show a warning message if envPrefix contains a whitespace`, () => {
@@ -909,17 +1372,79 @@ describe('resolveConfig', () => {
     expect(results2.clearScreen).toBe(false)
   })
 
-  test('resolveConfig with root path including "#" and "?" and "*" should warn ', async () => {
+  test('resolves the configured tsconfig path', async () => {
+    const root = path.resolve(import.meta.dirname, 'fixtures')
+    const resolved = await resolveConfig(
+      { root, tsconfig: './custom.tsconfig.json' },
+      'build',
+    )
+    expect(resolved.tsconfig).toBe(
+      normalizePath(path.resolve(root, 'custom.tsconfig.json')),
+    )
+
+    const absoluteTsconfig = path.resolve(root, 'absolute.tsconfig.json')
+    expect(
+      (
+        await resolveConfig(
+          { root, tsconfig: absoluteTsconfig, configFile: false },
+          'build',
+        )
+      ).tsconfig,
+    ).toBe(normalizePath(absoluteTsconfig))
+
+    expect(
+      (await resolveConfig({ root, configFile: false }, 'build')).tsconfig,
+    ).toBeUndefined()
+  })
+
+  test('resolveConfig with root path including "#" and "?" and "*" should warn', async () => {
     expect.assertions(1)
 
     const logger = createLogger('info')
     logger.warn = (str) => {
-      expect(str).to.include(
-        'Consider renaming the directory / file to remove the characters',
+      expect(str).toContain(
+        'Consider renaming the directory without the characters',
       )
     }
 
     await resolveConfig({ root: './inc?ud#s*', customLogger: logger }, 'build')
+  })
+
+  test('warns about ignored hooks returned from applyToEnvironment', async () => {
+    const warn = vi.fn()
+    const logger = createLogger('info', {
+      console: { warn } as unknown as Console,
+    })
+
+    await resolveConfig(
+      {
+        configFile: false,
+        customLogger: logger,
+        plugins: [
+          {
+            name: 'parent-plugin',
+            applyToEnvironment() {
+              return {
+                name: 'environment-plugin',
+                config: () => undefined,
+                configEnvironment: () => undefined,
+                configureServer: () => undefined,
+                configResolved: () => undefined,
+                resolveId: () => undefined,
+              }
+            },
+          },
+        ],
+      },
+      'serve',
+    )
+
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        'Plugin "environment-plugin" defines Vite-specific hooks (config, configEnvironment, configureServer, configResolved) in a plugin returned from applyToEnvironment. These hooks will be ignored.',
+      ),
+    )
   })
 
   test('syncs `build.rollupOptions` and `build.rolldownOptions`', async () => {
@@ -930,9 +1455,155 @@ describe('resolveConfig', () => {
     expect(resolved.worker!.rollupOptions).toStrictEqual(
       resolved.worker!.rolldownOptions,
     )
-    expect(resolved.optimizeDeps!.rollupOptions).toStrictEqual(
-      resolved.optimizeDeps!.rolldownOptions,
+  })
+
+  test('top-level input applies to the client environment only (non-inherit)', async () => {
+    const config = await resolveConfig({ input: 'src/main.ts' }, 'serve')
+
+    expect(config.input).toBe('src/main.ts')
+    expect(config.environments.client.input).toBe('src/main.ts')
+    expect(
+      config.environments.client.build.rolldownOptions.input,
+    ).toBeUndefined()
+    expect(config.environments.ssr.input).toBeUndefined()
+    expect(config.environments.ssr.build.rolldownOptions.input).toBeUndefined()
+  })
+
+  test('top-level input applies to the SSR environment when build.ssr is true in build', async () => {
+    const config = await resolveConfig(
+      {
+        input: 'src/entry-server.ts',
+        build: { ssr: true },
+      },
+      'build',
     )
+
+    expect(config.environments.ssr.input).toBe('src/entry-server.ts')
+  })
+
+  test('top-level input does not apply to the SSR environment when build.ssr is true in dev', async () => {
+    const config = await resolveConfig(
+      {
+        input: 'src/entry-server.ts',
+        build: { ssr: true },
+      },
+      'serve',
+    )
+
+    expect(config.environments.ssr.input).toBeUndefined()
+  })
+
+  test('per-environment input overrides the top-level value', async () => {
+    const config = await resolveConfig(
+      {
+        input: 'src/main.ts',
+        environments: {
+          ssr: { input: 'src/entry-server.ts' },
+        },
+      },
+      'serve',
+    )
+
+    expect(config.environments.client.input).toBe('src/main.ts')
+    expect(config.environments.ssr.input).toBe('src/entry-server.ts')
+  })
+
+  test('keeps array input relative to the root', async () => {
+    const config = await resolveConfig(
+      { input: ['src/a.ts', 'src/b.ts'] },
+      'serve',
+    )
+
+    expect(config.environments.client.input).toStrictEqual([
+      'src/a.ts',
+      'src/b.ts',
+    ])
+  })
+
+  test('keeps record input relative to the root', async () => {
+    const config = await resolveConfig(
+      { input: { main: 'src/a.ts', admin: 'src/b.ts' } },
+      'serve',
+    )
+
+    expect(config.environments.client.input).toStrictEqual({
+      main: 'src/a.ts',
+      admin: 'src/b.ts',
+    })
+  })
+
+  test('allows glob characters in input', async () => {
+    const input = 'src/*.ts'
+
+    await expect(resolveConfig({ input }, 'serve')).resolves.toMatchObject({
+      input,
+    })
+  })
+
+  test('preserves input escaping', async () => {
+    const inputs = ['src/\\*.ts', 'C:\\root\\@src\\index.html']
+
+    for (const input of inputs) {
+      await expect(resolveConfig({ input }, 'serve')).resolves.toMatchObject({
+        input,
+      })
+    }
+  })
+
+  test('allows non-glob special characters in input', async () => {
+    const cases: {
+      name: string
+      input: UserConfig['input']
+      expected: UserConfig['input']
+    }[] = [
+      {
+        name: 'special characters',
+        input: 'src/a-b_c$.ts',
+        expected: 'src/a-b_c$.ts',
+      },
+      ...(isWindows
+        ? [
+            {
+              name: 'windows path',
+              input: 'src\\foo.ts',
+              expected: 'src\\foo.ts',
+            },
+          ]
+        : []),
+    ]
+
+    for (const { name, input, expected } of cases) {
+      await expect(
+        resolveConfig({ input }, 'serve'),
+        name,
+      ).resolves.toMatchObject({
+        input: expected,
+      })
+    }
+  })
+
+  test('is used as the default for build.lib.entry when entry is omitted', async () => {
+    const config = await resolveConfig(
+      {
+        input: 'src/lib.ts',
+        build: { lib: { name: 'MyLib' } },
+      },
+      'build',
+    )
+
+    expect(config.build.lib && config.build.lib.entry).toBe('src/lib.ts')
+  })
+
+  test('explicit build.lib.entry overrides the top-level input', async () => {
+    const config = await resolveConfig(
+      {
+        input: 'src/lib.ts',
+        build: { lib: { entry: 'src/explicit.ts', name: 'MyLib' } },
+      },
+      'build',
+    )
+
+    expect(config.build.lib && config.build.lib.entry).toBe('src/explicit.ts')
   })
 })
 
@@ -1090,6 +1761,113 @@ test('config compat 3', async () => {
   `)
 })
 
+test('configEnvironment mutation does not leak between environments', async () => {
+  const resolved = await resolveConfig(
+    {
+      environments: {
+        custom1: {},
+        custom2: {},
+      },
+      plugins: [
+        {
+          name: 'test-mutate-env',
+          configEnvironment(name, config) {
+            if (name === 'custom1') {
+              config.resolve ??= {}
+              config.resolve.noExternal = true
+            }
+          },
+        },
+      ],
+    },
+    'serve',
+  )
+
+  expect(resolved.environments.custom1.resolve.noExternal).toBe(true)
+  expect(resolved.environments.custom2.resolve.noExternal).not.toBe(true)
+})
+
+test('build and environments.client.build has the same reference', async () => {
+  const nameCache = {}
+  const resolved = await resolveConfig(
+    {
+      build: {
+        terserOptions: {
+          nameCache,
+        },
+      },
+    },
+    'serve',
+  )
+
+  expect(resolved.build.terserOptions.nameCache).toBe(nameCache)
+  expect(resolved.environments.client.build.terserOptions.nameCache).toBe(
+    resolved.build.terserOptions.nameCache,
+  )
+})
+
+test('css.devSourcemap is deprecated in favor of dev.sourcemap.css', async () => {
+  const logger = createLogger('silent')
+  const warn = vi.spyOn(logger, 'warn')
+  const resolved = await resolveConfig(
+    {
+      configFile: false,
+      customLogger: logger,
+      css: { devSourcemap: true },
+      dev: { sourcemap: { js: false } },
+      environments: {
+        inherited: {},
+        inheritedWithJsOverride: { dev: { sourcemap: { js: true } } },
+        custom: { dev: { sourcemap: { css: false } } },
+      },
+    },
+    'serve',
+  )
+
+  expect(resolved.dev.sourcemap).toStrictEqual({ js: false, css: true })
+  expect(resolved.environments.client.dev.sourcemap).toStrictEqual({
+    js: false,
+    css: true,
+  })
+  expect(resolved.environments.inherited.dev.sourcemap).toStrictEqual({
+    js: false,
+    css: true,
+  })
+  expect(
+    resolved.environments.inheritedWithJsOverride.dev.sourcemap,
+  ).toStrictEqual({
+    js: true,
+    css: true,
+  })
+  expect(resolved.environments.custom.dev.sourcemap).toStrictEqual({
+    js: false,
+    css: false,
+  })
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringContaining(
+      'The `css.devSourcemap` option is deprecated. Please use `dev.sourcemap.css` instead.',
+    ),
+  )
+})
+
+test('dev.sourcemap.css takes precedence over css.devSourcemap', async () => {
+  const resolved = await resolveConfig(
+    {
+      configFile: false,
+      logLevel: 'silent',
+      css: { devSourcemap: true },
+      dev: { sourcemap: { css: false } },
+    },
+    'serve',
+  )
+
+  expect(resolved.dev.sourcemap).toStrictEqual({ js: true, css: false })
+  expect(resolved.environments.client.dev.sourcemap).toStrictEqual({
+    js: true,
+    css: false,
+  })
+})
+
 test('preTransformRequests', async () => {
   async function testConfig(inlineConfig: InlineConfig) {
     return Object.fromEntries(
@@ -1187,6 +1965,198 @@ test('preTransformRequests', async () => {
 describe('loadConfigFromFile', () => {
   const fixtures = path.resolve(import.meta.dirname, './fixtures/config')
 
+  describe('native-incompatibility warnings', () => {
+    const compatRoot = path.resolve(fixtures, './native-compat')
+
+    // eslint-disable-next-line n/no-unsupported-features/node-builtins
+    const supportsTypeStripping = !!process.features.typescript
+
+    const loadWithWarnings = async (
+      dir: string,
+      configFile = 'vite.config.js',
+    ) => {
+      const logger = createLogger('info')
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const root = path.resolve(compatRoot, dir)
+      await loadConfigFromFile(
+        {} as any,
+        path.resolve(root, configFile),
+        root,
+        undefined,
+        logger,
+        'bundle',
+      )
+      const messages = warn.mock.calls.map((c) =>
+        stripVTControlCharacters(c[0]),
+      )
+      warn.mockRestore()
+      return messages
+    }
+
+    test('warns on __dirname / __filename', async () => {
+      const messages = await loadWithWarnings('dirname')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - \`__dirname\` (vite.config.js:3:29). Use \`import.meta.dirname\` instead
+          - \`__filename\` (vite.config.js:4:30). Use \`import.meta.filename\` instead
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    // uses a `.ts` config with TypeScript-only syntax; skipped on Node
+    // versions without type stripping support
+    test.skipIf(!supportsTypeStripping)(
+      'warns on __dirname in a config using TypeScript syntax',
+      async () => {
+        const messages = await loadWithWarnings('ts-syntax', 'vite.config.ts')
+        expect(messages).toMatchInlineSnapshot(`
+          [
+            "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+            - \`__dirname\` (vite.config.ts:10:29). Use \`import.meta.dirname\` instead
+          Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+          ]
+        `)
+      },
+    )
+
+    test('warns on extension-less import', async () => {
+      const messages = await loadWithWarnings('extensionless')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - import "./helper" without a file extension (vite.config.js:1:23). Add the file extension
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('warns on directory-index import', async () => {
+      const messages = await loadWithWarnings('directory-index')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - import "./plugins" resolves to a directory index (vite.config.js:1:25). Import the index file directly
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('warns on JSON import without attributes', async () => {
+      const messages = await loadWithWarnings('json')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - JSON import "./data.json" without import attributes (vite.config.js:1:18). Add \`with { type: 'json' }\`
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('does not warn on JSON import with attributes', async () => {
+      expect(await loadWithWarnings('json-ok')).toHaveLength(0)
+    })
+
+    // uses a `.ts` config with TypeScript-only syntax; skipped on Node
+    // versions without type stripping support
+    test.skipIf(!supportsTypeStripping)(
+      'does not warn on type-only JSON imports',
+      async () => {
+        expect(
+          await loadWithWarnings('json-type-only', 'vite.config.ts'),
+        ).toHaveLength(0)
+      },
+    )
+
+    test.skipIf(!supportsTypeStripping)(
+      'warns on an inline type-only specifier from JSON without attributes',
+      async () => {
+        const messages = await loadWithWarnings(
+          'json-inline-type',
+          'vite.config.ts',
+        )
+        expect(messages).toMatchInlineSnapshot(`
+          [
+            "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+            - JSON import "./data.json" without import attributes (vite.config.ts:1:38). Add \`with { type: 'json' }\`
+          Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+          ]
+        `)
+      },
+    )
+
+    test('warns on named import from JSON module', async () => {
+      const messages = await loadWithWarnings('json-named-import')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - named import from JSON module "./data.json" (vite.config.js:1:10). JSON modules only provide a default export per spec. Use the default import and access the property
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('warns on named import from a bare JSON specifier', async () => {
+      const messages = await loadWithWarnings('json-named-import-bare')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - named import from JSON module "some-pkg/package.json" (vite.config.js:1:10). JSON modules only provide a default export per spec. Use the default import and access the property
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('does not warn on JSON default imports (`default as` included)', async () => {
+      expect(await loadWithWarnings('json-named-import-ok')).toHaveLength(0)
+    })
+
+    test('warns on an extension-less import that resolves to JSON', async () => {
+      const messages = await loadWithWarnings('json-extensionless')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - import "./foo" resolves to a JSON file (vite.config.js:1:18). Import it with a \`.json\` extension and \`with { type: 'json' }\`
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('does not warn on a native-compatible config', async () => {
+      expect(await loadWithWarnings('clean')).toHaveLength(0)
+    })
+
+    test('does not warn for a CJS config using __dirname', async () => {
+      expect(await loadWithWarnings('cjs', 'vite.config.cjs')).toHaveLength(0)
+    })
+
+    test('warns for an ESM file imported by a CJS config', async () => {
+      const messages = await loadWithWarnings(
+        'cjs-imports-esm',
+        'vite.config.cjs',
+      )
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - \`__dirname\` (esm-helper.mjs:1:35). Use \`import.meta.dirname\` instead
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+
+    test('warns on ESM syntax in a config under a `type: commonjs` package', async () => {
+      const messages = await loadWithWarnings('esm-in-commonjs-pkg')
+      expect(messages).toMatchInlineSnapshot(`
+        [
+          "(!) Your Vite config uses features that are unsupported by \`configLoader: 'native'\`, which is planned to become the default in a future major version of Vite:
+          - ESM syntax in a file loaded as CommonJS (vite.config.js:1:1). Use a \`.mjs\` extension or set \`"type": "module"\` in the closest package.json
+        Set \`VITE_CONFIG_NATIVE_IGNORE_WARNING=true\` to suppress this warning.",
+        ]
+      `)
+    })
+  })
+
   describe('load default files', () => {
     const root = path.resolve(fixtures, './loadConfigFromFile')
 
@@ -1217,8 +2187,9 @@ describe('loadConfigFromFile', () => {
         { command: 'build', mode: 'production' },
         undefined,
         root,
+        'silent',
       )
-      expect(result).toBeTruthy()
+      expect(result).not.toBeNull()
       expect(result?.config).toStrictEqual({ define: { foo: 1 } })
       expect(path.normalize(result!.path)).toBe(
         path.resolve(root, writtenConfig!),
@@ -1324,6 +2295,18 @@ describe('loadConfigFromFile', () => {
       `)
   })
 
+  test('cjs module vars are supported in esm', async () => {
+    const { config } = (await loadConfigFromFile(
+      {} as any,
+      path.resolve(fixtures, './cjs-module-vars-in-esm/vite.config.ts'),
+      path.resolve(fixtures, './cjs-module-vars-in-esm'),
+      'silent',
+    ))!
+    const c = config as any
+    expect(c.dirname).toContain('cjs-module-vars-in-esm')
+    expect(c.filename).toContain('vite.config.ts')
+  })
+
   test('import.meta properties are supported', async () => {
     const { config } = (await loadConfigFromFile(
       {} as any,
@@ -1351,6 +2334,35 @@ describe('loadConfigFromFile', () => {
     expect(c.dirname).toContain('shebang')
   })
 
+  test('injected variables follow a hashbang ending in CRLF', async () => {
+    const { config, path: configPath } = (await loadConfigFromFile(
+      {} as any,
+      path.resolve(fixtures, './shebang-crlf/vite.config.ts'),
+      path.resolve(fixtures, './shebang-crlf'),
+    ))!
+
+    const configFile = fs.readFileSync(configPath, 'utf8')
+    expect(configFile).toContain('\r\n')
+
+    const c = config as any
+    expect(c.dirname).toContain('shebang-crlf')
+  })
+
+  test('sourcemap of a nested config file points to itself', async () => {
+    const configPath = path.resolve(
+      fixtures,
+      './nested/.nested/vite.config.mts',
+    )
+    const { code } = await bundleConfigFile(configPath, true)
+    const [, base64Map] = code.match(
+      /\/\/# sourceMappingURL=data:application\/json;charset=utf-8;base64,(.+)/,
+    )!
+    const map = JSON.parse(Buffer.from(base64Map, 'base64').toString())
+    expect(map.sources.map(normalizePath)).toStrictEqual([
+      normalizePath(configPath),
+    ])
+  })
+
   describe('loadConfigFromFile with configLoader: native', () => {
     const fixtureRoot = path.resolve(fixtures, './native-import')
 
@@ -1368,7 +2380,168 @@ describe('loadConfigFromFile', () => {
           "value": "works",
         }
       `)
-      expect(result.dependencies.length).toBe(0)
+      expect(result.dependencies).toHaveLength(0)
     })
+  })
+
+  describe('cacheDir resolution', () => {
+    // Use /tmp to avoid findNearestPackageData finding a parent package.json
+    const tmpBase = path.join(os.tmpdir(), 'vite-cachedir-test')
+
+    afterEach(() => {
+      if (fs.existsSync(tmpBase)) {
+        fs.rmSync(tmpBase, { recursive: true, force: true })
+      }
+    })
+
+    test('uses node_modules/.vite when node_modules exists without package.json', async () => {
+      const tempDir = path.join(tmpBase, 'with-node-modules')
+      const nodeModulesDir = path.join(tempDir, 'node_modules')
+      fs.mkdirSync(nodeModulesDir, { recursive: true })
+
+      const config = await resolveConfig({ root: tempDir }, 'serve')
+
+      expect(config.cacheDir).toBe(
+        normalizePath(
+          path.resolve(fs.realpathSync.native(tempDir), 'node_modules/.vite'),
+        ),
+      )
+    })
+
+    test('uses .vite when neither package.json nor node_modules exist', async () => {
+      const tempDir = path.join(tmpBase, 'empty')
+      fs.mkdirSync(tempDir, { recursive: true })
+
+      const config = await resolveConfig({ root: tempDir }, 'serve')
+
+      expect(config.cacheDir).toBe(
+        normalizePath(path.resolve(fs.realpathSync.native(tempDir), '.vite')),
+      )
+    })
+  })
+})
+
+describe('root resolution', () => {
+  const fixtureRoot = path.resolve(
+    import.meta.dirname,
+    './fixtures/config/root-resolution',
+  )
+  const realDir = path.join(fixtureRoot, 'real')
+  const linkDir = path.join(fixtureRoot, 'link')
+
+  test('resolves a symlinked root to its real path', async () => {
+    const config = await resolveConfig({ root: linkDir }, 'serve')
+    expect(config.root).toBe(normalizePath(fs.realpathSync.native(realDir)))
+  })
+
+  test('keeps a symlinked root when resolve.preserveSymlinks is true', async () => {
+    const config = await resolveConfig(
+      { root: linkDir, resolve: { preserveSymlinks: true } },
+      'serve',
+    )
+    expect(config.root).toBe(normalizePath(linkDir))
+  })
+})
+
+describe('resolveServerOptions', () => {
+  const warnFn = vi.fn()
+  const logger = { warn: warnFn } as unknown as Logger
+
+  afterEach(() => {
+    delete process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+  })
+
+  test('adds single host from __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS = 'example.com'
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: [] },
+      logger,
+    )
+    expect(resolved.allowedHosts).toStrictEqual(['example.com'])
+  })
+
+  test('adds multiple hosts from __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS =
+      'example.com,test.com,dev.example.org'
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: [] },
+      logger,
+    )
+    expect(resolved.allowedHosts).toStrictEqual([
+      'example.com',
+      'test.com',
+      'dev.example.org',
+    ])
+  })
+
+  test('trims whitespace from hosts in __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS =
+      ' example.com , test.com , dev.example.org '
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: [] },
+      logger,
+    )
+    expect(resolved.allowedHosts).toStrictEqual([
+      'example.com',
+      'test.com',
+      'dev.example.org',
+    ])
+  })
+
+  test('filters empty hosts from __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS =
+      'example.com,,test.com,,'
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: [] },
+      logger,
+    )
+    expect(resolved.allowedHosts).toStrictEqual(['example.com', 'test.com'])
+  })
+
+  test('appends to existing allowedHosts', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS = 'new.com,another.com'
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: ['existing.com'] },
+      logger,
+    )
+    expect(resolved.allowedHosts).toStrictEqual([
+      'existing.com',
+      'new.com',
+      'another.com',
+    ])
+  })
+
+  test('does not modify allowedHosts when set to true', async () => {
+    process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS = 'example.com'
+    const resolved = await resolveServerOptions(
+      '/root',
+      { allowedHosts: true },
+      logger,
+    )
+    expect(resolved.allowedHosts).toBe(true)
+  })
+
+  test('throw an error if it contains `"` or `\'` or `\\`', async () => {
+    const envs = ['"example.com"', "'example.com'", '\\example.com']
+    for (const env of envs) {
+      process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS = env
+      const resolved = await resolveServerOptions(
+        '/root',
+        { allowedHosts: [] },
+        logger,
+      )
+      expect(resolved.allowedHosts).toStrictEqual([])
+      expect(warnFn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Skipping additional allowed hosts from environment variable due to reserved characters',
+        ),
+      )
+      warnFn.mockClear()
+    }
   })
 })

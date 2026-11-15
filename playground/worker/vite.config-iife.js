@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite'
-import workerPluginTestPlugin from './worker-plugin-test-plugin'
+import workerPluginTestPlugin from './worker-plugin-test-plugin.js'
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  input: command === 'serve' ? ['index.html', 'classic-esm.js'] : undefined,
   base: '/iife/',
   resolve: {
     alias: {
@@ -11,7 +12,7 @@ export default defineConfig({
   worker: {
     format: 'iife',
     plugins: () => [workerPluginTestPlugin()],
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         assetFileNames: 'assets/worker_asset-[name]-[hash].[ext]',
         chunkFileNames: 'assets/worker_chunk-[name]-[hash].js',
@@ -25,7 +26,7 @@ export default defineConfig({
     assetsInlineLimit: (filePath) =>
       filePath.endsWith('.svg') ? false : undefined,
     manifest: true,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         assetFileNames: 'assets/[name]-[hash].[ext]',
         chunkFileNames: 'assets/[name]-[hash].js',
@@ -40,7 +41,7 @@ export default defineConfig({
       config() {
         return {
           worker: {
-            rollupOptions: {
+            rolldownOptions: {
               output: {
                 entryFileNames: 'assets/worker_entry-[name].js',
               },
@@ -54,4 +55,4 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['@vitejs/test-dep-self-reference-url-worker'],
   },
-})
+}))

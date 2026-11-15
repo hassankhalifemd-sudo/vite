@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
-import { port, streams } from './serve'
 import { editFile, isServe, page } from '~utils'
+import { port, streams } from './serve'
 
 test('cli should work', async () => {
   // this test uses a custom serve implementation, so regular helpers for browserLogs and goto don't work
@@ -22,20 +22,14 @@ test('cli should work', async () => {
 
 test.runIf(isServe)('should restart', async () => {
   const logsLengthBeforeEdit = streams.server.out.length
-  editFile('./vite.config.js', (content) => content)
+  editFile('./vite.config.js', (content) => content + '\n')
   await expect
     .poll(() => {
       const logs = streams.server.out.slice(logsLengthBeforeEdit)
-      expect(logs).toEqual(
-        expect.arrayContaining([expect.stringMatching('server restarted')]),
-      )
+      expect(logs).toContainEqual(expect.stringMatching('server restarted'))
       // Don't reprint the server URLs as they are the same
-      expect(logs).not.toEqual(
-        expect.arrayContaining([expect.stringMatching('http://localhost')]),
-      )
-      expect(logs).not.toEqual(
-        expect.arrayContaining([expect.stringMatching('error')]),
-      )
+      expect(logs).not.toContainEqual(expect.stringMatching('http://localhost'))
+      expect(logs).not.toContainEqual(expect.stringMatching('error'))
     })
     .toSatisfy(() => true)
 })

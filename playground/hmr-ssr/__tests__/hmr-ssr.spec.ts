@@ -1,15 +1,6 @@
+import EventEmitter from 'node:events'
 import fs from 'node:fs'
 import { posix, resolve } from 'node:path'
-import EventEmitter from 'node:events'
-import {
-  afterAll,
-  beforeAll,
-  describe,
-  expect,
-  onTestFinished,
-  test,
-  vi,
-} from 'vitest'
 import type {
   InlineConfig,
   Plugin,
@@ -19,10 +10,20 @@ import type {
 import { createRunnableDevEnvironment, createServer } from 'vite'
 import type { ModuleRunner } from 'vite/module-runner'
 import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from 'vitest'
+import {
   addFile,
   createInMemoryLogger,
   editFile,
   isBuild,
+  isBundledDev,
   promiseWithResolvers,
   readFile,
   removeFile,
@@ -83,7 +84,7 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await untilConsoleLogAfter(
       () =>
         editFile('hmr.ts', (code) =>
-          code.replace('const foo = 1', 'const foo = 2'),
+          code.replace('const foo = 1', 'const foo = 2 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -100,7 +101,7 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await untilConsoleLogAfter(
       () =>
         editFile('hmr.ts', (code) =>
-          code.replace('const foo = 2', 'const foo = 3'),
+          code.replace('const foo = 2', 'const foo = 3 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -115,12 +116,44 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await expect.poll(() => el()).toMatch('3')
   })
 
+  test('hot data persists across module instances', async () => {
+    await untilConsoleLogAfter(
+      () =>
+        editFile('hotData.js', (code) =>
+          code.replace('const value = 1', 'const value = 2 '),
+        ),
+      [
+        '>>> vite:beforeUpdate -- update',
+        '(hot data) value from execution: 1',
+        '(hot data) value from dispose: 1',
+        updated('/hotData.js'),
+        '>>> vite:afterUpdate -- update',
+      ],
+      true,
+    )
+
+    await untilConsoleLogAfter(
+      () =>
+        editFile('hotData.js', (code) =>
+          code.replace('const value = 2', 'const value = 3  '),
+        ),
+      [
+        '>>> vite:beforeUpdate -- update',
+        '(hot data) value from execution: 2',
+        '(hot data) value from dispose: 2',
+        updated('/hotData.js'),
+        '>>> vite:afterUpdate -- update',
+      ],
+      true,
+    )
+  })
+
   test('accept dep', async () => {
     const el = () => hmr('.dep')
     await untilConsoleLogAfter(
       () =>
         editFile('hmrDep.js', (code) =>
-          code.replace('const foo = 1', 'const foo = 2'),
+          code.replace('const foo = 1', 'const foo = 2 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -140,7 +173,7 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await untilConsoleLogAfter(
       () =>
         editFile('hmrDep.js', (code) =>
-          code.replace('const foo = 2', 'const foo = 3'),
+          code.replace('const foo = 2', 'const foo = 3 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -163,7 +196,7 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await untilConsoleLogAfter(
       () =>
         editFile('hmrNestedDep.js', (code) =>
-          code.replace('const foo = 1', 'const foo = 2'),
+          code.replace('const foo = 1', 'const foo = 2 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -183,7 +216,7 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
     await untilConsoleLogAfter(
       () =>
         editFile('hmrNestedDep.js', (code) =>
-          code.replace('const foo = 2', 'const foo = 3'),
+          code.replace('const foo = 2', 'const foo = 3 '),
         ),
       [
         '>>> vite:beforeUpdate -- update',
@@ -261,16 +294,15 @@ describe.skipIf(isBuild)('hmr works correctly', () => {
 
   test('plugin hmr handler + custom event', async () => {
     const el = () => hmr('.custom')
-    editFile('customFile.js', (code) => code.replace('custom', 'edited'))
-    await expect.poll(() => el()).toMatch('edited')
+    editFile('customFile.js', (code) => code.replace('custom', 'edited2'))
+    await expect.poll(() => el()).toMatch('edited2')
   })
 
   test('plugin hmr remove custom events', async () => {
     const el = () => hmr('.toRemove')
-    editFile('customFile.js', (code) => code.replace('custom', 'edited'))
-    await expect.poll(() => el()).toMatch('edited')
-    editFile('customFile.js', (code) => code.replace('edited', 'custom'))
-    await expect.poll(() => el()).toMatch('edited')
+    await expect.poll(() => el()).toMatch('edited2')
+    editFile('customFile.js', (code) => code.replace('edited2', 'custom33'))
+    await expect.poll(() => el()).toMatch('edited2')
   })
 
   test('plugin client-server communication', async () => {
@@ -307,7 +339,7 @@ describe('self accept with different entry point formats', () => {
       await untilConsoleLogAfter(
         () =>
           editFile('unresolved.ts', (code) =>
-            code.replace('const foo = 1', 'const foo = 2'),
+            code.replace('const foo = 1', 'const foo = 2 '),
           ),
         [
           'foo was: 1',
@@ -322,7 +354,7 @@ describe('self accept with different entry point formats', () => {
       await untilConsoleLogAfter(
         () =>
           editFile('unresolved.ts', (code) =>
-            code.replace('const foo = 2', 'const foo = 3'),
+            code.replace('const foo = 2', 'const foo = 3 '),
           ),
         [
           'foo was: 2',
@@ -378,7 +410,7 @@ describe('acceptExports', () => {
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual([
+          expect(logs).toStrictEqual([
             'reloaded >>> Y',
             `[vite] hot updated: ${callbackUrl}`,
           ])
@@ -387,11 +419,11 @@ describe('acceptExports', () => {
 
       await untilConsoleLogAfter(
         () => {
-          editFile(callbackFile, (code) => code.replace("x = 'Y'", "x = 'Z'"))
+          editFile(callbackFile, (code) => code.replace("x = 'Y'", "x = 'Z' "))
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual([
+          expect(logs).toStrictEqual([
             'reloaded (2) >>> Z',
             `[vite] hot updated: ${callbackUrl}`,
           ])
@@ -405,11 +437,14 @@ describe('acceptExports', () => {
 
       await untilConsoleLogAfter(
         () => {
-          editFile(depFile, (code) => code.replace('dep0', (dep = 'dep1')))
+          editFile(
+            depFile,
+            (code) => code.replace('dep0', (dep = 'dep1')) + '\n',
+          )
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual([
+          expect(logs).toStrictEqual([
             `<<<<<< A0 B0 D0 ; ${dep}`,
             `[vite] hot updated: ${url}`,
           ])
@@ -420,11 +455,11 @@ describe('acceptExports', () => {
     test('accepts itself and refreshes on change', async () => {
       await untilConsoleLogAfter(
         () => {
-          editFile(file, (code) => code.replace(/(\b[A-Z])0/g, '$11'))
+          editFile(file, (code) => code.replace(/(\b[A-Z])0/g, '$11') + '\n')
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual([
+          expect(logs).toStrictEqual([
             `<<<<<< A1 B1 D1 ; ${dep}`,
             `[vite] hot updated: ${url}`,
           ])
@@ -435,18 +470,20 @@ describe('acceptExports', () => {
     test('accepts itself and refreshes on 2nd change', async () => {
       await untilConsoleLogAfter(
         () => {
-          editFile(file, (code) =>
-            code
-              .replace(/(\b[A-Z])1/g, '$12')
-              .replace(
-                "acceptExports(['a', 'default']",
-                "acceptExports(['b', 'default']",
-              ),
+          editFile(
+            file,
+            (code) =>
+              code
+                .replace(/(\b[A-Z])1/g, '$12')
+                .replace(
+                  "acceptExports(['a', 'default']",
+                  "acceptExports(['b', 'default']",
+                ) + '\n',
           )
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual([
+          expect(logs).toStrictEqual([
             `<<<<<< A2 B2 D2 ; ${dep}`,
             `[vite] hot updated: ${url}`,
           ])
@@ -457,7 +494,7 @@ describe('acceptExports', () => {
     test('does not accept itself anymore after acceptedExports change', async () => {
       await untilConsoleLogAfter(
         async () => {
-          editFile(file, (code) => code.replace(/(\b[A-Z])2/g, '$13'))
+          editFile(file, (code) => code.replace(/(\b[A-Z])2/g, '$13') + '\n')
         },
         [PROGRAM_RELOAD, />>>>>>/],
         (logs) => {
@@ -496,7 +533,10 @@ describe('acceptExports', () => {
     test('does not stop the HMR bubble on change to dep', async () => {
       await untilConsoleLogAfter(
         async () => {
-          editFile(depFile, (code) => code.replace('dep0', (dep = 'dep1')))
+          editFile(
+            depFile,
+            (code) => code.replace('dep0', (dep = 'dep1')) + '\n',
+          )
         },
         [PROGRAM_RELOAD, />>>>>>/],
         (logs) => {
@@ -509,7 +549,7 @@ describe('acceptExports', () => {
       test('with named exports', async () => {
         await untilConsoleLogAfter(
           async () => {
-            editFile(namedFile, (code) => code.replace(a, 'A1'))
+            editFile(namedFile, (code) => code.replace(a, 'A1') + '\n')
           },
           [PROGRAM_RELOAD, />>>>>>/],
           (logs) => {
@@ -521,7 +561,7 @@ describe('acceptExports', () => {
       test('with default export', async () => {
         await untilConsoleLogAfter(
           async () => {
-            editFile(defaultFile, (code) => code.replace('def0', 'def1'))
+            editFile(defaultFile, (code) => code.replace('def0', 'def1') + '\n')
           },
           [PROGRAM_RELOAD, />>>>>>/],
           (logs) => {
@@ -602,7 +642,10 @@ describe('acceptExports', () => {
       },
       HOT_UPDATED,
       (logs) => {
-        expect(logs).toEqual(['>>> side FX !!', updated(`/${testDir}/${file}`)])
+        expect(logs).toStrictEqual([
+          '>>> side FX !!',
+          updated(`/${testDir}/${file}`),
+        ])
       },
     )
   })
@@ -625,11 +668,14 @@ describe('acceptExports', () => {
 
       await untilConsoleLogAfter(
         () => {
-          editFile(file, (code) => code.replace('-- unused --', '-> unused <-'))
+          editFile(
+            file,
+            (code) => code.replace('-- unused --', '-> unused <-') + '\n',
+          )
         },
         HOT_UPDATED,
         (logs) => {
-          expect(logs).toEqual(['-> unused <-', updated(url)])
+          expect(logs).toStrictEqual(['-> unused <-', updated(url)])
         },
       )
     })
@@ -649,8 +695,11 @@ describe('acceptExports', () => {
 
       await untilConsoleLogAfter(
         async () => {
-          editFile(file, (code) =>
-            code.replace('foo0', 'foo1').replace('-- used --', '-> used <-'),
+          editFile(
+            file,
+            (code) =>
+              code.replace('foo0', 'foo1').replace('-- used --', '-> used <-') +
+              '\n',
           )
         },
         [PROGRAM_RELOAD, /used:foo/],
@@ -682,21 +731,21 @@ describe('acceptExports', () => {
 
         await untilConsoleLogAfter(
           () => {
-            editFile(file, (code) => code.replace(/([abc])0/g, '$11'))
+            editFile(file, (code) => code.replace(/([abc])0/g, '$11') + '\n')
           },
           HOT_UPDATED,
           (logs) => {
-            expect(logs).toEqual(['all >>>>>> a1, b1, c1', updated(url)])
+            expect(logs).toStrictEqual(['all >>>>>> a1, b1, c1', updated(url)])
           },
         )
 
         await untilConsoleLogAfter(
           () => {
-            editFile(file, (code) => code.replace(/([abc])1/g, '$12'))
+            editFile(file, (code) => code.replace(/([abc])1/g, '$12') + '\n')
           },
           HOT_UPDATED,
           (logs) => {
-            expect(logs).toEqual(['all >>>>>> a2, b2, c2', updated(url)])
+            expect(logs).toStrictEqual(['all >>>>>> a2, b2, c2', updated(url)])
           },
         )
       })
@@ -716,7 +765,7 @@ describe('acceptExports', () => {
 
         await untilConsoleLogAfter(
           async () => {
-            editFile(file, (code) => code.replace(/([abc])0/g, '$11'))
+            editFile(file, (code) => code.replace(/([abc])0/g, '$11') + '\n')
           },
           [PROGRAM_RELOAD, '>>> ready <<<'],
           (logs) => {
@@ -727,9 +776,13 @@ describe('acceptExports', () => {
       })
     }
 
-    describe('import * from ...', () => testStarExports('star-imports'))
+    describe('import * from ...', () => {
+      testStarExports('star-imports')
+    })
 
-    describe('dynamic import(...)', () => testStarExports('dynamic-imports'))
+    describe('dynamic import(...)', () => {
+      testStarExports('dynamic-imports')
+    })
   })
 })
 
@@ -776,13 +829,15 @@ test('should hmr when file is deleted and restored', async () => {
     .toMatch('parent:not-child')
 
   // restore the file
-  addFile(childFile, originalChildFileCode)
-  editFile(parentFile, (code) =>
-    code.replace(
-      "export const childValue = 'not-child'",
-      "export { value as childValue } from './child'",
-    ),
-  )
+  await untilConsoleLogAfter(() => {
+    addFile(childFile, originalChildFileCode)
+    editFile(parentFile, (code) =>
+      code.replace(
+        "export const childValue = 'not-child'",
+        "export { value as childValue } from './child'",
+      ),
+    )
+  }, 'file-delete-restore/child.js hot data after prune: undefined')
   await expect.poll(() => hmr('.file-delete-restore')).toMatch('parent:child')
 })
 
@@ -814,7 +869,7 @@ test('delete file should not break hmr', async () => {
 
   // remove unused file
   removeFile('intermediate-file-delete/re-export.js')
-  __HMR__['.intermediate-file-delete-increment'] = '1' // reset state
+  globalThis.__HMR__['.intermediate-file-delete-increment'] = '1' // reset state
   await expect
     .poll(() => hmr('.intermediate-file-delete-display'))
     .toMatch('count is 1!')
@@ -879,7 +934,7 @@ test('import.meta.hot?.accept', async () => {
   await untilConsoleLogAfter(
     () =>
       editFile('optional-chaining/child.js', (code) =>
-        code.replace('const foo = 1', 'const foo = 2'),
+        code.replace('const foo = 1', 'const foo = 2 '),
       ),
     '(optional-chaining) child update',
   )
@@ -923,7 +978,7 @@ test('not inlined assets HMR', async () => {
   await untilConsoleLogAfter(
     () =>
       editFile('logo-no-inline.svg', (code) =>
-        code.replace('height="30px"', 'height="40px"'),
+        code.replace('height="30px"', 'height="40px" '),
       ),
     /Logo-no-inline updated/,
   )
@@ -938,14 +993,14 @@ test('inlined assets HMR', async () => {
   await untilConsoleLogAfter(
     () =>
       editFile('logo.svg', (code) =>
-        code.replace('height="30px"', 'height="40px"'),
+        code.replace('height="30px"', 'height="40px" '),
       ),
     /Logo updated/,
   )
   // Should be updated with new data url
   const updatedLogoUrl = el()
   expect(updatedLogoUrl).toMatch(/^data:image\/svg\+xml/)
-  expect(updatedLogoUrl).not.toEqual(initialLogoUrl)
+  expect(updatedLogoUrl).not.toBe(initialLogoUrl)
 })
 
 type UntilBrowserLogAfterCallback = (logs: string[]) => PromiseLike<void> | void
@@ -1138,6 +1193,9 @@ async function setupModuleRunner(
       disabled: true,
       noDiscovery: true,
       include: [],
+    },
+    experimental: {
+      bundledDev: isBundledDev,
     },
     ...serverOptions,
   })

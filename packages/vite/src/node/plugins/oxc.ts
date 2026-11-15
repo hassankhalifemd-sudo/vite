@@ -1,21 +1,21 @@
 import path from 'node:path'
+import colors from 'picocolors'
+import type { RolldownError, RolldownLog, SourceMap } from 'rolldown'
+import { viteTransformPlugin as nativeTransformPlugin } from 'rolldown/experimental'
 import type {
   TransformOptions as OxcTransformOptions,
   TransformResult as OxcTransformResult,
 } from 'rolldown/utils'
 import { transformSync } from 'rolldown/utils'
-import { viteTransformPlugin as nativeTransformPlugin } from 'rolldown/experimental'
-import type { RolldownError, RolldownLog, SourceMap } from 'rolldown'
-import colors from 'picocolors'
 import type { FSWatcher } from '#dep-types/chokidar'
-import { createFilter, ensureWatchedFile, normalizePath } from '../utils'
-import type { ResolvedConfig } from '../config'
-import type { Plugin } from '../plugin'
+import type { Environment } from '..'
 import { cleanUrl } from '../../shared/utils'
-import { type Environment, perEnvironmentPlugin } from '..'
-import type { ViteDevServer } from '../server'
+import type { ResolvedConfig } from '../config'
 import { JS_TYPES_RE } from '../constants'
 import type { Logger } from '../logger'
+import type { Plugin } from '../plugin'
+import type { ViteDevServer } from '../server'
+import { createFilter, ensureWatchedFile, normalizePath } from '../utils'
 import { type ESBuildOptions, getTSConfigResolutionCache } from './esbuild'
 
 // IIFE content looks like `var MyLib = (function() {` or `this.nested.myLib = (function() {`.
@@ -153,7 +153,9 @@ export async function transformWithOxc(
     filename,
     code,
     resolvedOptions,
-    getTSConfigResolutionCache(config),
+    options?.tsconfig === undefined || options.tsconfig === config?.tsconfig
+      ? getTSConfigResolutionCache(config)
+      : undefined,
   )
   if (
     watcher &&
@@ -186,12 +188,13 @@ export async function transformWithOxc(
       configurable: true,
       enumerable: true,
       get: () => result.errors,
-      set: (value) =>
+      set: (value) => {
         Object.defineProperty(wrapper, 'errors', {
           configurable: true,
           enumerable: true,
           value,
-        }),
+        })
+      },
     })
     throw wrapper
   }
@@ -208,35 +211,6 @@ function shouldSkipWarning(warning: RolldownLog): boolean {
 }
 
 export function oxcPlugin(config: ResolvedConfig): Plugin {
-  if (config.isBundled) {
-    return perEnvironmentPlugin('native:transform', (environment) => {
-      const {
-        jsxInject,
-        include = /\.(m?ts|[jt]sx)$/,
-        exclude = /\.js$/,
-        jsxRefreshInclude,
-        jsxRefreshExclude,
-        ..._transformOptions
-      } = config.oxc as Exclude<OxcOptions, false | undefined>
-
-      const transformOptions: OxcTransformOptions = _transformOptions
-      transformOptions.sourcemap =
-        environment.config.mode !== 'build' ||
-        !!environment.config.build.sourcemap
-
-      return nativeTransformPlugin({
-        root: environment.config.root,
-        include,
-        exclude,
-        jsxRefreshInclude,
-        jsxRefreshExclude,
-        isServerConsumer: environment.config.consumer === 'server',
-        jsxInject,
-        transformOptions,
-      })
-    })
-  }
-
   const options = config.oxc as OxcOptions
   const {
     jsxInject,
@@ -292,7 +266,11 @@ export function oxcPlugin(config: ResolvedConfig): Plugin {
     ) {
       result.jsx = { ...jsxOptions, refresh: false }
     }
-    if (jsxRefreshFilter?.(id) && !JS_TYPES_RE.test(cleanUrl(id))) {
+    if (
+      jsxRefreshFilter?.(id) &&
+      !JS_TYPES_RE.test(id) &&
+      !JS_TYPES_RE.test(cleanUrl(id))
+    ) {
       result.lang = 'js'
     }
 
@@ -303,6 +281,36 @@ export function oxcPlugin(config: ResolvedConfig): Plugin {
 
   return {
     name: 'vite:oxc',
+    applyToEnvironment(environment) {
+      if (environment.config.isBundled) {
+        const {
+          jsxInject,
+          include = /\.(m?ts|[jt]sx)$/,
+          exclude = /\.js$/,
+          jsxRefreshInclude,
+          jsxRefreshExclude,
+          ..._transformOptions
+        } = environment.config.oxc as Exclude<OxcOptions, false | undefined>
+
+        const transformOptions: OxcTransformOptions = _transformOptions
+        transformOptions.sourcemap =
+          environment.config.mode !== 'build' ||
+          !!environment.config.build.sourcemap
+
+        return nativeTransformPlugin({
+          root: environment.config.root,
+          tsconfig: environment.config.tsconfig,
+          include,
+          exclude,
+          jsxRefreshInclude,
+          jsxRefreshExclude,
+          isServerConsumer: environment.config.consumer === 'server',
+          jsxInject,
+          transformOptions,
+        })
+      }
+      return true
+    },
     configureServer(_server) {
       server = _server
     },
@@ -384,7 +392,7 @@ export function convertEsbuildConfigToOxcConfig(
       jsxOptions.development = esbuildTransformOptions.jsxDev
     }
     if (esbuildTransformOptions.jsxSideEffects !== undefined) {
-      jsxOptions.pure = esbuildTransformOptions.jsxSideEffects
+      jsxOptions.pure = !esbuildTransformOptions.jsxSideEffects
     }
 
     oxcOptions.jsx = jsxOptions

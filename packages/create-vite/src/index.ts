@@ -1,12 +1,13 @@
+import type { SpawnOptions } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import util from 'node:util'
-import type { SpawnOptions } from 'node:child_process'
-import spawn from 'cross-spawn'
-import mri from 'mri'
+import util, { type InspectColor } from 'node:util'
 import * as prompts from '@clack/prompts'
-import { determineAgent } from '@vercel/detect-agent'
+import mri from 'mri'
+import { detectAgent } from 'std-env'
+import { xSync } from 'tinyexec'
+import packageInfo from '../package.json' with { type: 'json' }
 
 const {
   blue,
@@ -28,14 +29,23 @@ const argv = mri<{
   overwrite?: boolean
   immediate?: boolean
   interactive?: boolean
+  eslint?: boolean
+  devtools?: boolean
 }>(process.argv.slice(2), {
-  boolean: ['help', 'overwrite', 'immediate', 'interactive'],
+  boolean: [
+    'help',
+    'overwrite',
+    'immediate',
+    'interactive',
+    'eslint',
+    'devtools',
+  ],
   alias: { h: 'help', t: 'template', i: 'immediate' },
   string: ['template'],
 })
 const cwd = process.cwd()
 
-// prettier-ignore
+// oxfmt-ignore
 const helpMessage = `\
 Usage: create-vite [OPTION]... [DIRECTORY]
 
@@ -44,9 +54,12 @@ When running in TTY, the CLI will start in interactive mode.
 
 Options:
   -t, --template NAME                   use a specific template
-  -i, --immediate                       install dependencies and start dev
+  -i, --immediate / --no-immediate      install dependencies and start dev
+  --eslint / --no-eslint                use ESLint instead of Oxlint (only for React templates)
+  --devtools / --no-devtools            add Vite DevTools
   --overwrite                           remove existing files if target directory is not empty
   --interactive / --no-interactive      force interactive / non-interactive mode
+  -h, --help                            display this help message
 
 Available templates:
 ${yellow    ('vanilla-ts          vanilla'       )}
@@ -169,12 +182,20 @@ const FRAMEWORKS: Framework[] = [
         customCommand: 'npm create react-router@latest TARGET_DIR',
       },
       {
+        name: 'custom-tanstack-start-react',
+        display: 'TanStack Start ↗',
+        link: 'https://tanstack.com/start',
+        color: cyan,
+        customCommand:
+          'npm exec -- @tanstack/cli@latest create TARGET_DIR --framework react --build-tool vite --interactive',
+      },
+      {
         name: 'custom-tanstack-router-react',
         display: 'TanStack Router ↗',
         link: 'https://tanstack.com/router',
         color: cyan,
         customCommand:
-          'npm exec -- @tanstack/cli@latest create TARGET_DIR --interactive',
+          'npm exec -- @tanstack/cli@latest create TARGET_DIR --framework react --build-tool vite --router-only --interactive',
       },
       {
         name: 'redwoodsdk-standard',
@@ -271,12 +292,20 @@ const FRAMEWORKS: Framework[] = [
         color: yellow,
       },
       {
+        name: 'custom-tanstack-start-solid',
+        display: 'TanStack Start ↗',
+        link: 'https://tanstack.com/start',
+        color: cyan,
+        customCommand:
+          'npm exec -- @tanstack/cli@latest create TARGET_DIR --framework solid --build-tool vite --interactive',
+      },
+      {
         name: 'custom-tanstack-router-solid',
         display: 'TanStack Router ↗',
         link: 'https://tanstack.com/router',
         color: cyan,
         customCommand:
-          'npm exec -- @tanstack/cli@latest create TARGET_DIR --framework solid --interactive',
+          'npm exec -- @tanstack/cli@latest create TARGET_DIR --framework solid --build-tool vite --router-only --interactive',
       },
       {
         name: 'custom-vike-solid',
@@ -390,20 +419,23 @@ const TEMPLATES = FRAMEWORKS.map((f) => f.variants.map((v) => v.name)).reduce(
 
 const renameFiles: Record<string, string | undefined> = {
   _gitignore: '.gitignore',
+  '_oxlintrc.json': '.oxlintrc.json',
 }
 
 const defaultTargetDir = 'vite-project'
 
 function run([command, ...args]: string[], options?: SpawnOptions) {
-  const { status, error } = spawn.sync(command, args, options)
-  if (status != null && status > 0) {
-    process.exit(status)
-  }
-
-  if (error) {
+  let exitCode: number | undefined
+  try {
+    ;({ exitCode } = xSync(command, args, { nodeOptions: options }))
+  } catch (error) {
     console.error(`\n${command} ${args.join(' ')} error!`)
     console.error(error)
     process.exit(1)
+  }
+
+  if (exitCode != null && exitCode > 0) {
+    process.exit(exitCode)
   }
 }
 
@@ -441,6 +473,8 @@ async function init() {
   const argOverwrite = argv.overwrite
   const argImmediate = argv.immediate
   const argInteractive = argv.interactive
+  const argEslint = argv.eslint
+  const argDevtools = argv.devtools
 
   const help = argv.help
   if (help) {
@@ -448,17 +482,22 @@ async function init() {
     return
   }
 
+  console.log(`\n${cyan(`create-vite v${packageInfo.version}`)}\n`)
+
   const interactive = argInteractive ?? process.stdin.isTTY
 
   // Detect AI agent environment for better agent experience (AX)
-  const { isAgent } = await determineAgent()
-  if (isAgent && interactive) {
+  if (interactive && detectAgent().name) {
     console.log(
       '\nTo create in one go, run: create-vite <DIRECTORY> --no-interactive --template <TEMPLATE>\n',
     )
   }
 
-  const pkgInfo = pkgFromUserAgent(process.env.npm_config_user_agent)
+  // Vite+ (`vp`) exposes its own `VP_USER_AGENT` because the underlying package
+  // manager overwrites `npm_config_user_agent` when running `vp dlx create-vite`.
+  const pkgInfo = pkgFromUserAgent(
+    process.env.VP_USER_AGENT || process.env.npm_config_user_agent,
+  )
   const cancel = () => prompts.cancel('Operation cancelled')
 
   // 1. Get project name and target dir
@@ -616,13 +655,56 @@ async function init() {
     const replacedArgs = args.map((arg) =>
       arg.replace('TARGET_DIR', () => targetDir),
     )
-    const { status } = spawn.sync(command, replacedArgs, {
-      stdio: 'inherit',
+    const { exitCode } = xSync(command, replacedArgs, {
+      nodeOptions: { stdio: 'inherit' },
     })
-    process.exit(status ?? 0)
+    process.exit(exitCode ?? 0)
   }
 
-  // 5. Ask about immediate install and package manager
+  // 5. Ask whether to use ESLint instead of Oxlint (React templates only)
+  const isReactTemplate = template === 'react' || template === 'react-ts'
+  let eslint = argEslint
+  if (!isReactTemplate && eslint) {
+    prompts.log.warn(
+      '`--eslint` is only supported for React templates and will be ignored',
+    )
+    eslint = false
+  }
+  if (isReactTemplate && eslint === undefined) {
+    if (interactive) {
+      const eslintResult = await prompts.select({
+        message: 'Which linter to use?',
+        options: [
+          { label: 'Oxlint', value: false },
+          { label: 'ESLint', value: true },
+        ],
+      })
+      if (prompts.isCancel(eslintResult)) return cancel()
+      eslint = eslintResult
+    } else {
+      eslint = false
+    }
+  }
+
+  // 6. Ask whether to add Vite DevTools
+  let devtools = argDevtools
+  if (devtools === undefined) {
+    if (interactive) {
+      const devtoolsResult = await prompts.select<boolean>({
+        message: 'Add Vite DevTools?',
+        options: [
+          { label: 'No', value: false },
+          { label: 'Yes', value: true },
+        ],
+      })
+      if (prompts.isCancel(devtoolsResult)) return cancel()
+      devtools = devtoolsResult
+    } else {
+      devtools = false
+    }
+  }
+
+  // 7. Ask about immediate install and package manager
   let immediate = argImmediate
   if (immediate === undefined) {
     if (interactive) {
@@ -678,6 +760,14 @@ async function init() {
 
   if (isReactCompiler) {
     setupReactCompiler(root, template.endsWith('-ts'))
+  }
+
+  if (eslint) {
+    setupEslint(root, template.endsWith('-ts'))
+  }
+
+  if (devtools) {
+    setupDevTools(root, template.endsWith('-ts'))
   }
 
   if (immediate) {
@@ -772,11 +862,11 @@ function pkgFromUserAgent(userAgent: string | undefined): PkgInfo | undefined {
 
 function setupReactCompiler(root: string, isTs: boolean) {
   // renovate: datasource=npm depName=@rolldown/plugin-babel
-  const babelPluginVersion = '0.2.3'
+  const babelPluginVersion = '0.3.0'
   // renovate: datasource=npm depName=babel-plugin-react-compiler
   const reactCompilerPluginVersion = '1.0.0'
   // renovate: datasource=npm depName=@babel/core
-  const babelCoreVersion = '7.29.0'
+  const babelCoreVersion = '7.29.13'
   // renovate: datasource=npm depName=@types/babel__core
   const typesBabelCoreVersion = '7.20.5'
 
@@ -792,6 +882,7 @@ function setupReactCompiler(root: string, isTs: boolean) {
     if (isTs) {
       devDepsEntries.push(['@types/babel__core', `^${typesBabelCoreVersion}`])
     }
+    // oxlint-disable-next-line typescript/require-array-sort-compare
     devDepsEntries.sort()
     asObject.devDependencies = Object.fromEntries(devDepsEntries)
     return JSON.stringify(asObject, null, 2) + '\n'
@@ -816,8 +907,189 @@ import babel from '@rolldown/plugin-babel'`,
   )
   updateReactCompilerReadme(
     root,
-    'The React Compiler is enabled on this template. See [this documentation](https://react.dev/learn/react-compiler) for more information.\n\nNote: This will impact Vite dev & build performances.',
+    'The React Compiler is enabled on this template. See [this documentation](https://react.dev/learn/react-compiler) for more information.\n\n' +
+      'Note: This will impact Vite dev & build performances.\n' +
+      'You can also try [the experimental native React Compiler support in plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md#rust-react-compiler) by using `compiler: true` in the plugin options instead of using the Babel plugin.',
   )
+}
+
+function setupEslint(root: string, isTs: boolean) {
+  // renovate: datasource=npm depName=@eslint/js
+  const eslintJsVersion = '10.0.1'
+  // renovate: datasource=npm depName=eslint
+  const eslintVersion = '10.14.0'
+  // renovate: datasource=npm depName=eslint-plugin-react-hooks
+  const eslintPluginReactHooksVersion = '7.1.1'
+  // renovate: datasource=npm depName=eslint-plugin-react-refresh
+  const eslintPluginReactRefreshVersion = '0.5.7'
+  // renovate: datasource=npm depName=globals
+  const globalsVersion = '17.14.0'
+  // renovate: datasource=npm depName=typescript-eslint
+  const typescriptEslintVersion = '8.72.1'
+
+  const eslintConfigForTS = /* js */ `import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import tseslint from 'typescript-eslint'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      js.configs.recommended,
+      tseslint.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+    },
+  },
+])
+`
+  const eslintConfigForJS = /* js */ `import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import { defineConfig, globalIgnores } from 'eslint/config'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{js,jsx}'],
+    extends: [
+      js.configs.recommended,
+      reactHooks.configs.flat.recommended,
+      reactRefresh.configs.vite,
+    ],
+    languageOptions: {
+      globals: globals.browser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+])
+`
+
+  fs.rmSync(path.resolve(root, '.oxlintrc.json'))
+
+  const eslintConfig = isTs ? eslintConfigForTS : eslintConfigForJS
+  fs.writeFileSync(path.resolve(root, 'eslint.config.js'), eslintConfig)
+
+  editFile(path.resolve(root, 'package.json'), (content) => {
+    const asObject = JSON.parse(content)
+    if (isTs) {
+      // Keep TypeScript 6 until typescript-eslint supports TypeScript 7.
+      // https://github.com/typescript-eslint/typescript-eslint/issues/10940
+      asObject.devDependencies.typescript = '~6.0.3'
+    }
+    const devDepsEntries = Object.entries(asObject.devDependencies).filter(
+      ([name]) => name !== 'oxlint',
+    )
+    devDepsEntries.push(
+      ['@eslint/js', `^${eslintJsVersion}`],
+      ['eslint', `^${eslintVersion}`],
+      ['eslint-plugin-react-hooks', `^${eslintPluginReactHooksVersion}`],
+      ['eslint-plugin-react-refresh', `^${eslintPluginReactRefreshVersion}`],
+      ['globals', `^${globalsVersion}`],
+    )
+    if (isTs) {
+      devDepsEntries.push(['typescript-eslint', `^${typescriptEslintVersion}`])
+    }
+    // oxlint-disable-next-line typescript/require-array-sort-compare
+    devDepsEntries.sort()
+    asObject.devDependencies = Object.fromEntries(devDepsEntries)
+    asObject.scripts.lint = 'eslint .'
+    return JSON.stringify(asObject, null, 2) + '\n'
+  })
+
+  editFile(path.resolve(root, 'README.md'), (content) => {
+    content = content.replace(
+      'with HMR and some Oxlint rules',
+      'with HMR and some ESLint rules',
+    )
+    const headingIndex = content.indexOf(
+      '## Expanding the Oxlint configuration',
+    )
+    if (headingIndex === -1) {
+      console.warn('Could not update Oxlint section in README.md')
+      return content
+    }
+    const eslintTypeAwareConfig = /* js */ `export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+`
+    const eslintReactConfig = /* js */ `// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+`
+
+    const eslintSection = isTs
+      ? `## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+\`\`\`js
+${eslintTypeAwareConfig}
+\`\`\`
+
+You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+
+\`\`\`js
+${eslintReactConfig}
+\`\`\`
+`
+      : `## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [\`typescript-eslint\`](https://typescript-eslint.io) in your project.
+`
+    return content.slice(0, headingIndex) + eslintSection
+  })
 }
 
 function updateReactCompilerReadme(root: string, newBody: string) {
@@ -832,6 +1104,63 @@ function updateReactCompilerReadme(root: string, newBody: string) {
     return content.replace(
       content.slice(bodyStart + 2, compilerSectionEnd - 1),
       newBody,
+    )
+  })
+}
+
+function setupDevTools(root: string, isTs: boolean) {
+  // renovate: datasource=npm depName=@vitejs/devtools
+  const devtoolsVersion = '0.8.0'
+  // renovate: datasource=npm depName=@vitejs/devtools-vite
+  const devtoolsViteVersion = '0.8.0'
+  // renovate: datasource=npm depName=@vitejs/devtools-rolldown
+  const devtoolsRolldownVersion = '0.8.0'
+
+  const option = `{
+    // Remove this \`apply\` property to enable devtools for build as well
+    apply: 'serve',
+  }`
+
+  editFile(path.resolve(root, 'package.json'), (content) => {
+    const asObject = JSON.parse(content)
+    const devDepsEntries = Object.entries(asObject.devDependencies ?? {})
+    devDepsEntries.push(['@vitejs/devtools', `^${devtoolsVersion}`])
+    devDepsEntries.push(['@vitejs/devtools-vite', `^${devtoolsViteVersion}`])
+    devDepsEntries.push([
+      '@vitejs/devtools-rolldown',
+      `^${devtoolsRolldownVersion}`,
+    ])
+    // oxlint-disable-next-line typescript/require-array-sort-compare
+    devDepsEntries.sort()
+    asObject.devDependencies = Object.fromEntries(devDepsEntries)
+    return JSON.stringify(asObject, null, 2) + '\n'
+  })
+
+  const configPath = path.resolve(root, `vite.config.${isTs ? 'ts' : 'js'}`)
+  if (!fs.existsSync(configPath)) {
+    // vanilla and lit templates don't ship a config file
+    fs.writeFileSync(
+      configPath,
+      /* js */ `import { defineConfig } from 'vite'
+
+// https://vite.dev/config/
+export default defineConfig({
+  devtools: ${option},
+})
+`,
+    )
+    return
+  }
+  editFile(configPath, (content) => {
+    if (!content.includes('defineConfig({')) {
+      prompts.log.warn(
+        `Could not add \`devtools\` to ${path.basename(configPath)}, please add it manually`,
+      )
+      return content
+    }
+    return content.replace(
+      'defineConfig({',
+      `defineConfig({\n  devtools: ${option},`,
     )
   })
 }
@@ -853,6 +1182,10 @@ function getFullCustomCommand(customCommand: string, pkgInfo?: PkgInfo) {
         if (pkgManager === 'bun') {
           return 'bun x create-'
         }
+        // nub has no `create` verb; `nubx` runs the create- package directly
+        if (pkgManager === 'nub') {
+          return 'nubx create-'
+        }
         // Deno uses `run -A npm:create-` instead of `create` or `init` to also provide needed perms
         if (pkgManager === 'deno') {
           return 'deno run -A npm:create-'
@@ -860,6 +1193,10 @@ function getFullCustomCommand(customCommand: string, pkgInfo?: PkgInfo) {
         // pnpm doesn't support the -- syntax
         if (pkgManager === 'pnpm') {
           return 'pnpm create '
+        }
+        // Vite+ uses `vp dlx create-` directly on the package
+        if (pkgManager === 'vp') {
+          return 'vp dlx create-'
         }
         // For other package managers, preserve the original format
         return customCommand.startsWith('npm create -- ')
@@ -880,8 +1217,15 @@ function getFullCustomCommand(customCommand: string, pkgInfo?: PkgInfo) {
         if (pkgManager === 'bun') {
           return 'bun x '
         }
+        if (pkgManager === 'nub') {
+          return 'nubx '
+        }
         if (pkgManager === 'deno') {
           return 'deno run -A npm:'
+        }
+        // Vite+ uses `vp dlx` to execute package binaries
+        if (pkgManager === 'vp') {
+          return 'vp dlx '
         }
         // Use `npm exec` in all other cases,
         // including Yarn 1.x and other custom npm clients.
@@ -917,16 +1261,17 @@ function getRunCommand(agent: string, script: string) {
       return [agent, script]
     case 'deno':
       return [agent, 'task', script]
+    // `vp dev` runs the Vite+ built-in dev server and ignores the `dev` script,
+    // so Vite+ needs `vp run dev` to run the script like other package managers
+    case 'vp':
     default:
       return [agent, 'run', script]
   }
 }
 
-type ColorName = Exclude<Parameters<typeof util.styleText>[0], any[]>
-
 function createColors() {
-  return new Proxy({} as Record<ColorName, ColorFunc>, {
-    get(_, prop: ColorName) {
+  return new Proxy({} as Record<InspectColor, ColorFunc>, {
+    get(_, prop: InspectColor) {
       // eslint-disable-next-line n/no-unsupported-features/node-builtins -- our supported nodejs range supports `styleText` but in experimental state, which is fine
       return (str: string) => util.styleText(prop, str)
     },

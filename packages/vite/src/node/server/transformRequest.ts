@@ -1,17 +1,20 @@
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { init, parse as parseImports } from 'es-module-lexer'
 import getEtag from 'etag'
 import MagicString from 'magic-string'
-import { init, parse as parseImports } from 'es-module-lexer'
+import colors from 'picocolors'
 import type {
   ModuleType,
   PartialResolvedId,
   SourceDescription,
   SourceMap,
 } from 'rolldown'
-import colors from 'picocolors'
+import { cleanUrl, slash, unwrapId } from '../../shared/utils'
+import { checkPublicFile } from '../publicDir'
 import type { EnvironmentModuleNode } from '../server/moduleGraph'
+import { ssrTransform } from '../ssr/ssrTransform'
 import {
   createDebugger,
   ensureWatchedFile,
@@ -24,18 +27,15 @@ import {
   stripBase,
   timeFrom,
 } from '../utils'
-import { ssrTransform } from '../ssr/ssrTransform'
-import { checkPublicFile } from '../publicDir'
-import { cleanUrl, slash, unwrapId } from '../../shared/utils'
+import type { DevEnvironment } from './environment'
+import { isFileLoadingAllowed } from './middlewares/static'
+import { isServerAccessDeniedForTransform } from './middlewares/transform'
+import { throwClosedServerError } from './pluginContainer'
 import {
   applySourcemapIgnoreList,
   extractSourcemapFromFile,
   injectSourcesContent,
 } from './sourcemap'
-import { isFileLoadingAllowed } from './middlewares/static'
-import { throwClosedServerError } from './pluginContainer'
-import type { DevEnvironment } from './environment'
-import { isServerAccessDeniedForTransform } from './middlewares/transform'
 
 export const ERR_LOAD_URL = 'ERR_LOAD_URL'
 export const ERR_LOAD_PUBLIC_URL = 'ERR_LOAD_PUBLIC_URL'
@@ -252,7 +252,7 @@ async function loadAndTransform(
   if (
     !options.skipFsCheck &&
     id[0] !== '\0' &&
-    isServerAccessDeniedForTransform(config, id)
+    isServerAccessDeniedForTransform(environment, id)
   ) {
     const err: any = new Error(`Denied ID ${id}`)
     err.code = ERR_DENIED_ID
@@ -276,10 +276,7 @@ async function loadAndTransform(
     // as string
     // only try the fallback if access is allowed, skip for out of root url
     // like /service-worker.js or /api/users
-    if (
-      options.skipFsCheck ||
-      isFileLoadingAllowed(environment.getTopLevelConfig(), slash(file))
-    ) {
+    if (options.skipFsCheck || isFileLoadingAllowed(config, slash(file))) {
       try {
         code = await fsp.readFile(file, 'utf-8')
         debugLoad?.(`${timeFrom(loadStart)} [fs] ${prettyUrl}`)
@@ -476,14 +473,14 @@ async function handleModuleSoftInvalidation(
   }
   // We need to transform each imports with new timestamps if available
   else {
-    await init
+    await init()
     const source = transformResult.code
     const s = new MagicString(source)
     const [imports] = parseImports(source, mod.id || undefined)
 
     for (const imp of imports) {
-      let rawUrl = source.slice(imp.s, imp.e)
-      if (rawUrl === 'import.meta') continue
+      let rawUrl = source.slice(imp.start, imp.end)
+      if (imp.type === 'import-meta') continue
 
       const hasQuotes = rawUrl[0] === '"' || rawUrl[0] === "'"
       if (hasQuotes) {
@@ -491,28 +488,31 @@ async function handleModuleSoftInvalidation(
       }
 
       const urlWithoutTimestamp = removeTimestampQuery(rawUrl)
-      // hmrUrl must be derived the same way as importAnalysis
-      const hmrUrl = unwrapId(
+      // moduleUrl must be derived the same way as importAnalysis
+      const moduleUrl = unwrapId(
         stripBase(
           removeImportQuery(urlWithoutTimestamp),
           environment.config.base,
         ),
       )
       for (const importedMod of mod.importedModules) {
-        if (importedMod.url !== hmrUrl) continue
+        if (importedMod.url !== moduleUrl) continue
         if (importedMod.lastHMRTimestamp > 0) {
           const replacedUrl = injectQuery(
             urlWithoutTimestamp,
             `t=${importedMod.lastHMRTimestamp}`,
           )
-          const start = hasQuotes ? imp.s + 1 : imp.s
-          const end = hasQuotes ? imp.e - 1 : imp.e
+          const start = hasQuotes ? imp.start + 1 : imp.start
+          const end = hasQuotes ? imp.end - 1 : imp.end
           s.overwrite(start, end, replacedUrl)
         }
 
-        if (imp.d === -1 && environment.config.dev.preTransformRequests) {
+        if (
+          imp.type !== 'dynamic' &&
+          environment.config.dev.preTransformRequests
+        ) {
           // pre-transform known direct imports
-          environment.warmupRequest(hmrUrl)
+          environment.warmupRequest(moduleUrl)
         }
 
         break

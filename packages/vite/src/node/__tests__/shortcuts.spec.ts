@@ -1,7 +1,7 @@
 import type { Mock } from 'vitest'
 import { describe, expect, test, vi } from 'vitest'
-import { createServer } from '../server'
 import { preview } from '../preview'
+import { createServer } from '../server'
 import { bindCLIShortcuts } from '../shortcuts'
 
 describe('bindCLIShortcuts', () => {
@@ -139,7 +139,7 @@ describe('bindCLIShortcuts', () => {
       // Check the order of shortcuts before restart
       expect(
         server._shortcutsState?.options.customShortcuts?.map((s) => s.key),
-      ).toEqual(['x', 'y'])
+      ).toStrictEqual(['x', 'y'])
 
       // Restart the server
       await server.restart()
@@ -147,7 +147,7 @@ describe('bindCLIShortcuts', () => {
       // Shortcut orders should be preserved after restart
       expect(
         server._shortcutsState?.options.customShortcuts?.map((s) => s.key),
-      ).toEqual(['x', 'y'])
+      ).toStrictEqual(['x', 'y'])
 
       expect.assert(
         server._shortcutsState?.rl === readline,

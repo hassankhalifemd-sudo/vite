@@ -1,6 +1,6 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import crypto from 'node:crypto'
 import { defineConfig } from 'vite'
 
 const noncePlaceholder = '#$NONCE$#'
@@ -13,7 +13,7 @@ const createNonce = () => crypto.randomBytes(16).toString('base64')
 const setNonceHeader = (res, nonce) => {
   res.setHeader(
     'Content-Security-Policy',
-    `default-src 'nonce-${nonce}'; connect-src 'self'`,
+    `default-src 'nonce-${nonce}'; connect-src 'self'; require-trusted-types-for 'script'; trusted-types 'none'; worker-src 'none'`,
   )
 }
 

@@ -1,12 +1,19 @@
-import path from 'node:path'
 import type { OutgoingHttpHeaders, ServerResponse } from 'node:http'
+import path from 'node:path'
+import escapeHtml from 'escape-html'
 import type { Options } from 'sirv'
 import sirv from 'sirv'
-import escapeHtml from 'escape-html'
+import type { Alias } from '#dep-types/alias'
 import type { Connect } from '#dep-types/connect'
-import type { ViteDevServer } from '../../server'
-import type { ResolvedConfig } from '../../config'
+import {
+  cleanUrl,
+  isWindows,
+  slash,
+  withTrailingSlash,
+} from '../../../shared/utils'
+import type { ResolvedConfig, ResolvedEnvironmentOptions } from '../../config'
 import { FS_PREFIX } from '../../constants'
+import type { ViteDevServer } from '../../server'
 import {
   decodeURIIfPossible,
   fsPathFromUrl,
@@ -16,25 +23,19 @@ import {
   isParentDirectory,
   isSameFilePath,
   normalizePath,
-  removeLeadingSlash,
   urlRE,
 } from '../../utils'
-import {
-  cleanUrl,
-  isWindows,
-  slash,
-  withTrailingSlash,
-} from '../../../shared/utils'
+import type { DevEnvironment } from '../environment'
 
 const knownJavascriptExtensionRE = /\.(?:[tj]sx?|[cm][tj]s)$/
 const ERR_DENIED_FILE = 'ERR_DENIED_FILE'
 
 const sirvOptions = ({
-  config,
+  environment,
   getHeaders,
   disableFsServeCheck,
 }: {
-  config: ResolvedConfig
+  environment: DevEnvironment
   getHeaders: () => OutgoingHttpHeaders | undefined
   disableFsServeCheck?: boolean
 }): Options => {
@@ -61,7 +62,7 @@ const sirvOptions = ({
     shouldServe: disableFsServeCheck
       ? undefined
       : (filePath) => {
-          const servingAccessResult = checkLoadingAccess(config, filePath)
+          const servingAccessResult = checkLoadingAccess(environment, filePath)
           if (servingAccessResult === 'denied') {
             const error: any = new Error('denied access')
             error.code = ERR_DENIED_FILE
@@ -85,7 +86,7 @@ export function servePublicMiddleware(
   const serve = sirv(
     dir,
     sirvOptions({
-      config: server.config,
+      environment: server.environments.client,
       getHeaders: () => server.config.server.headers,
       disableFsServeCheck: true,
     }),
@@ -93,7 +94,7 @@ export function servePublicMiddleware(
 
   const toFilePath = (url: string) => {
     let filePath = cleanUrl(url)
-    if (filePath.indexOf('%') !== -1) {
+    if (filePath.includes('%')) {
       try {
         filePath = decodeURI(filePath)
       } catch {
@@ -128,7 +129,7 @@ export function serveStaticMiddleware(
   const serve = sirv(
     dir,
     sirvOptions({
-      config: server.config,
+      environment: server.environments.client,
       getHeaders: () => server.config.server.headers,
     }),
   )
@@ -158,29 +159,7 @@ export function serveStaticMiddleware(
     }
 
     // apply aliases to static requests as well
-    let redirectedPathname: string | undefined
-    for (const { find, replacement } of server.config.resolve.alias) {
-      const matches =
-        typeof find === 'string'
-          ? pathname.startsWith(find)
-          : find.test(pathname)
-      if (matches) {
-        redirectedPathname = pathname.replace(find, replacement)
-        break
-      }
-    }
-    if (redirectedPathname) {
-      // dir is pre-normalized to posix style
-      if (redirectedPathname.startsWith(withTrailingSlash(dir))) {
-        redirectedPathname = redirectedPathname.slice(dir.length)
-      }
-    }
-
-    const resolvedPathname = redirectedPathname || pathname
-    let fileUrl = path.resolve(dir, removeLeadingSlash(resolvedPathname))
-    if (resolvedPathname.endsWith('/') && fileUrl[fileUrl.length - 1] !== '/') {
-      fileUrl = withTrailingSlash(fileUrl)
-    }
+    const redirectedPathname = resolveStaticPathname(pathname, server.config)
     if (redirectedPathname) {
       url.pathname = encodeURI(redirectedPathname)
       req.url = url.href.slice(url.origin.length)
@@ -198,13 +177,41 @@ export function serveStaticMiddleware(
   }
 }
 
+export function resolveStaticPathname(
+  pathname: string,
+  config: ResolvedConfig,
+): string | undefined {
+  const aliased = applyStaticAlias(pathname, config.resolve.alias)
+  return aliased?.startsWith(withTrailingSlash(config.root))
+    ? aliased.slice(config.root.length)
+    : aliased
+}
+
+export function applyStaticAlias(
+  pathname: string,
+  aliases: Alias[],
+): string | undefined {
+  for (const { find, replacement } of aliases) {
+    const matches =
+      typeof find === 'string'
+        ? pathname === find || pathname.startsWith(`${find}/`)
+        : find.test(pathname)
+    if (matches) {
+      if (typeof find === 'string') {
+        return replacement + pathname.slice(find.length)
+      }
+      return pathname.replace(find, replacement)
+    }
+  }
+}
+
 export function serveRawFsMiddleware(
   server: ViteDevServer,
 ): Connect.NextHandleFunction {
   const serveFromRoot = sirv(
     '/',
     sirvOptions({
-      config: server.config,
+      environment: server.environments.client,
       getHeaders: () => server.config.server.headers,
     }),
   )
@@ -267,7 +274,10 @@ export function isFileServingAllowed(
 
   if (!config.server.fs.strict) return true
   const filePath = fsPathFromUrl(url)
-  return isFileLoadingAllowed(config, filePath)
+  return isFileLoadingAllowed(
+    config as ResolvedConfig & ResolvedEnvironmentOptions,
+    filePath,
+  )
 }
 
 /**
@@ -286,25 +296,61 @@ export function isFileInTargetPath(
   )
 }
 
+const windowsDriveRE = /^[A-Z]:/i
+// A Windows 8.3 "short name" segment looks like `NAME~1` or `NAME~1.EXT`: at
+// most 6 non-`~`/`.` characters, a `~`, then digits, within a single path
+// segment. Matching only this shape (rather than any `~`) still blocks the
+// short-name aliasing bypass while allowing filenames that merely contain a
+// tilde, e.g. `0~rslib-runtime.js`.
+const windowsShortNameSegmentRE = /^[^~.]{1,6}~\d+(?:\.[^~.]{0,3})?$/
+
+/**
+ * Warning: parameters are not validated, only works with normalized absolute paths
+ */
+export function looksLikeWindowsShortNamePath(filePath: string): boolean {
+  return (
+    filePath.includes('~') &&
+    filePath
+      .split('/')
+      .some((segment) => windowsShortNameSegmentRE.test(segment))
+  )
+}
+
 /**
  * Warning: parameters are not validated, only works with normalized absolute paths
  */
 export function isFileLoadingAllowed(
-  config: ResolvedConfig,
+  environmentConfig: ResolvedConfig & ResolvedEnvironmentOptions,
   filePath: string,
 ): boolean {
-  const { fs } = config.server
+  const { fs } = environmentConfig.server
 
   if (!fs.strict) return true
+
+  if (isWindows && looksLikeWindowsShortNamePath(filePath)) {
+    // Windows 8.3 short names (e.g. `PROGRA~1`) can alias a different long
+    // path and can be used to bypass the check.
+    // While it is valid to have files named similar to automatically generated
+    // short names, it is unlikely that a user would create them, so we
+    // disallow them to be safe.
+    return false
+  }
+
+  const hasDriveLetter = isWindows && windowsDriveRE.test(filePath)
+  const hasColon = (hasDriveLetter ? filePath.slice(2) : filePath).includes(':')
+  if (hasColon) {
+    // the `:` is included in the path which may be used for NTFS ADS
+    return false
+  }
 
   // NOTE: `fs.readFile('/foo.png/')` tries to load `'/foo.png'`
   // so we should check the path without trailing slash
   const filePathWithoutTrailingSlash = filePath.endsWith('/')
     ? filePath.slice(0, -1)
     : filePath
-  if (config.fsDenyGlob(filePathWithoutTrailingSlash)) return false
+  if (environmentConfig.fsDenyGlob(filePathWithoutTrailingSlash)) return false
 
-  if (config.safeModulePaths.has(filePath)) return true
+  if (environmentConfig.safeModulePaths.has(filePath)) return true
 
   if (fs.allow.some((uri) => isFileInTargetPath(uri, filePath))) return true
 
@@ -312,10 +358,10 @@ export function isFileLoadingAllowed(
 }
 
 export function checkLoadingAccess(
-  config: ResolvedConfig,
+  environment: DevEnvironment,
   path: string,
 ): 'allowed' | 'denied' | 'fallback' {
-  if (isFileLoadingAllowed(config, slash(path))) {
+  if (isFileLoadingAllowed(environment.config, slash(path))) {
     return 'allowed'
   }
   if (isFileReadable(path)) {
